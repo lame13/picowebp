@@ -71,7 +71,7 @@ function synthRgb(int $w, int $h): string
             // floats itself, which is deprecated now.  Truncation is the same
             // either way, so the fixtures are unchanged.
             $out .= chr((int) ($x * 255 / max(1, $w - 1) + $noise * 0.3) & 0xFF);
-            $out .= chr(($y * 255 / max(1, $h - 1)) & 0xFF);
+            $out .= chr((int) ($y * 255 / max(1, $h - 1)) & 0xFF);
             $out .= chr((int) (($x + $y) * 127 / max(1, $w + $h - 2) + $noise) & 0xFF);
         }
     }
