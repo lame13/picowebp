@@ -1,0 +1,310 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * picowebp CLI: encode a PNG, JPEG or raw RGB buffer to lossy WebP.
+ *
+ *   picowebp <in.png|in.jpg|in.raw> <out.webp> [qindex] [options]
+ *
+ * A WebP input is detected by content and skipped: it is already the format
+ * this writes.  That is not an error, it is exit code 4 and no output file.
+ *
+ * Works both from a Composer install (vendor/bin/picowebp) and straight out of
+ * a checkout of this package.
+ */
+
+$root = dirname(__DIR__);
+$vendored = $root . '/vendor/autoload.php';
+if (is_file($vendored)) {
+    require_once $vendored;
+}
+// Self-contained fallback: the library files require_once each other, so this
+// is a no-op when Composer's autoloader already found them.
+foreach (['Vp8Tables', 'AlphaCoder', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput'] as $file) {
+    require_once $root . '/src/' . $file . '.php';
+}
+
+use PicoWebP\Vp8\AlphaCoder;
+use PicoWebP\Vp8\ImageInput;
+use PicoWebP\Vp8\ImageMeta;
+use PicoWebP\Vp8\SkippedInput;
+use PicoWebP\Vp8\Vp8LossyEncoder;
+
+$usage = <<<'TXT'
+usage: picowebp <in.png|in.jpg|in.raw> <out.webp> [qindex] [options]
+
+  --quality=0..100      quality, mapped to the VP8 quantiser (default 80)
+  --rgb=WxH             read the input as headerless 8-bit RGB, no GD involved
+  --alpha-plane=FILE    raw 8-bit alpha plane to go with --rgb
+  --alpha=keep|flatten|fail
+                        coded by default; "flatten" drops it; "fail" exits 3
+  --alpha-filter=0..3   force an ALPH prediction filter (default: pick one)
+  --icc=FILE            write this ICC profile instead of the source's
+  --no-icc              drop the source's ICC profile
+  --bundled             use the bundled PNG/JPEG readers even if GD is installed
+  --no-gd               refuse to use GD at all
+  --reencode-webp       re-encode a WebP source instead of skipping it
+                        (needs GD: nothing here decodes WebP without it)
+  --dump-yuv=FILE       also write the padded Y/U/V planes
+  --json                machine-readable report on stdout
+
+Quality / CPU knobs (all default on where they help):
+  --no-adapt-probs      skip coefficient probability adaptation (~half the CPU)
+  --no-rd               plain SAD mode search instead of rate-distortion
+  --rd-lambda=N         move along the rate-distortion curve
+  --prune=N             evaluate only the N best intra modes (N=4 is 28% faster)
+  --trellis             per-coefficient trellis quantisation (2.3x CPU)
+  --no-skip / --skip    macroblock skip flags
+
+exit codes: 0 encoded, 1 error (bad input, or an output that could not be
+written), 3 --alpha=fail refused, 4 skipped (already a WebP)
+TXT;
+
+$argvIn = array_slice($argv, 1);
+$pos = [];
+$flags = [];
+foreach ($argvIn as $a) {
+    if ($a === '--help' || $a === '-h') {
+        echo $usage, "\n";
+        exit(0);
+    }
+    if (str_starts_with($a, '--')) {
+        $kv = explode('=', substr($a, 2), 2);
+        $flags[$kv[0]] = $kv[1] ?? true;
+    } else {
+        $pos[] = $a;
+    }
+}
+
+if (count($pos) < 2) {
+    fwrite(STDERR, $usage . "\n");
+    exit(1);
+}
+
+[$in, $out] = $pos;
+$qIndex = isset($pos[2]) ? (int) $pos[2] : null;
+
+/**
+ * Report an input that has nothing to convert and hand back the exit code for
+ * it.  Nothing is written: an existing $out is left exactly as it was, so a
+ * queue can skip the file without losing what a previous run produced.
+ */
+$reportSkipped = static function (ImageMeta $meta, string $in, string $out, bool $json): int {
+    $report = [
+        'in' => $in,
+        'out' => $out,
+        'status' => 'skipped',
+        'reason' => 'webp (already the target format)',
+        'source' => $meta->describe(),
+        'width' => $meta->width,
+        'height' => $meta->height,
+        'bytes' => (int) @filesize($in),
+    ];
+    if ($json) {
+        echo json_encode($report), "\n";
+    } else {
+        foreach ($report as $k => $v) {
+            echo str_pad($k, 20), $v === null ? '-' : $v, "\n";
+        }
+        printf("\nnothing to do: %s is already a WebP\n", basename($in));
+    }
+
+    return 4;
+};
+
+$alphaMode = strtolower((string) ($flags['alpha'] ?? 'keep'));
+if (!in_array($alphaMode, ['keep', 'flatten', 'fail'], true)) {
+    fwrite(STDERR, "unknown --alpha mode: $alphaMode (keep|flatten|fail)\n");
+    exit(1);
+}
+
+$tLoad = microtime(true);
+$alphaPlane = null;
+$sourceIcc = null;
+$sourceMeta = null;
+
+if (isset($flags['rgb'])) {
+    if (!preg_match('/^(\d+)x(\d+)$/', (string) $flags['rgb'], $m)) {
+        fwrite(STDERR, "--rgb expects WxH, e.g. --rgb=1200x800\n");
+        exit(1);
+    }
+    $w = (int) $m[1];
+    $h = (int) $m[2];
+    $rgb = (string) @file_get_contents($in);
+    if (strlen($rgb) !== $w * $h * 3) {
+        fwrite(STDERR, sprintf("raw input is %d bytes, expected %d for %dx%d RGB\n", strlen($rgb), $w * $h * 3, $w, $h));
+        exit(1);
+    }
+    if (isset($flags['alpha-plane'])) {
+        $alphaPlane = (string) @file_get_contents((string) $flags['alpha-plane']);
+        if (strlen($alphaPlane) !== $w * $h) {
+            fwrite(STDERR, sprintf("alpha plane is %d bytes, expected %d\n", strlen($alphaPlane), $w * $h));
+            exit(1);
+        }
+    }
+} else {
+    if (isset($flags['bundled'])) {
+        ImageInput::$preferBundled = true;
+    }
+    if (isset($flags['no-gd'])) {
+        ImageInput::$gdAvailable = false;
+    }
+    if (isset($flags['reencode-webp'])) {
+        ImageInput::$skipWebp = false;
+    }
+    try {
+        $sourceMeta = ImageMeta::read($in);
+        $w = $sourceMeta->width;
+        $h = $sourceMeta->height;
+        // Already a WebP: the conversion a caller wants has already happened.
+        // exit(4) rather than 0 so a queue can tell "wrote a file" from
+        // "there was nothing to write".  This is decided before any other
+        // policy flag, because none of them mean anything for a skipped file.
+        if ($sourceMeta->isWebp() && ImageInput::$skipWebp) {
+            exit($reportSkipped($sourceMeta, $in, $out, isset($flags['json'])));
+        }
+        if ($alphaMode === 'fail' && $sourceMeta->mayHaveAlpha()) {
+            fwrite(STDERR, "image has an alpha channel and --alpha=fail was requested\n");
+            exit(3);
+        }
+        $rgb = ImageInput::load($in, $w, $h, $alphaPlane, $sourceIcc);
+    } catch (SkippedInput $e) {
+        // Backstop for anything above that skipped without asking first.
+        exit($reportSkipped($e->meta ?? ImageMeta::read($in), $in, $out, isset($flags['json'])));
+    } catch (\RuntimeException $e) {
+        fwrite(STDERR, $e->getMessage() . "\n");
+        exit(1);
+    }
+}
+$loadSeconds = microtime(true) - $tLoad;
+
+if ($alphaMode === 'flatten') {
+    $alphaPlane = null;
+}
+
+$icc = null;
+if (isset($flags['icc'])) {
+    $icc = (string) @file_get_contents((string) $flags['icc']);
+    if ($icc === '') {
+        fwrite(STDERR, "cannot read ICC profile: {$flags['icc']}\n");
+        exit(1);
+    }
+} elseif (!isset($flags['no-icc'])) {
+    $icc = $sourceIcc;
+}
+
+$enc = $qIndex === null && isset($flags['quality'])
+    ? Vp8LossyEncoder::fromQuality((int) $flags['quality'])
+    : new Vp8LossyEncoder($qIndex ?? 40);
+
+$toggles = [
+    'no-bpred' => ['enableBPred', false],
+    'skip' => ['enableSkipFlags', true],
+    'no-skip' => ['enableSkipFlags', false],
+    'adapt-probs' => ['adaptProbs', true],
+    'no-adapt-probs' => ['adaptProbs', false],
+    'no-rd' => ['enableRd', false],
+    'trellis' => ['enableTrellis', true],
+    'no-trellis' => ['enableTrellis', false],
+];
+foreach ($toggles as $flag => [$prop, $value]) {
+    if (isset($flags[$flag])) {
+        $enc->{$prop} = $value;
+    }
+}
+$floatOptions = [
+    'bpred-bias' => 'bpredBias',
+    'prob-margin' => 'probAdaptMargin',
+    'rd-lambda' => 'rdLambda',
+    'uv-lambda' => 'rdLambdaUv',
+    'i16-lambda' => 'rdLambdaI16',
+    'i4-lambda' => 'rdLambdaI4',
+    'quant-bias' => 'quantBias',
+];
+foreach ($floatOptions as $flag => $prop) {
+    if (isset($flags[$flag])) {
+        $enc->{$prop} = (float) $flags[$flag];
+    }
+}
+$intOptions = [
+    'skip-prob' => 'skipProb',
+    'uv-delta' => 'uvAcDelta',
+    'prune' => 'rdPruneCandidates',
+    'trellis-sweeps' => 'trellisSweeps',
+];
+foreach ($intOptions as $flag => $prop) {
+    if (isset($flags[$flag])) {
+        $enc->{$prop} = (int) $flags[$flag];
+    }
+}
+if (isset($flags['skip-prob'])) {
+    $enc->enableSkipFlags = true;
+}
+if ($alphaPlane !== null) {
+    $enc->alphaPlane = $alphaPlane;
+}
+if ($icc !== null && $icc !== '') {
+    $enc->iccProfile = $icc;
+}
+if (isset($flags['alpha-filter'])) {
+    $enc->alphaFilter = (int) $flags['alpha-filter'];
+}
+
+$res = $enc->encode($rgb, $w, $h);
+
+/**
+ * Write a file, all of it or none of it, and say so on stderr.
+ *
+ * The return value is the whole point: file_put_contents() happily returns
+ * false on an unwritable destination, and a short count on a full disk.  A
+ * queue that trusted the exit code would mark the job done with nothing on
+ * disk, so a failed write exits nonzero before any success report is printed.
+ */
+$writeFile = static function (string $path, string $bytes, string $what): void {
+    $wrote = @file_put_contents($path, $bytes);
+    if ($wrote === false) {
+        fwrite(STDERR, "cannot write $what $path: the destination is not writable\n");
+        exit(1);
+    }
+    if ($wrote !== strlen($bytes)) {
+        fwrite(STDERR, sprintf("cannot write %s %s: wrote %d of %d bytes\n", $what, $path, $wrote, strlen($bytes)));
+        exit(1);
+    }
+};
+
+$writeFile($out, $res['webp'], 'image');
+if (isset($flags['dump-yuv'])) {
+    $writeFile((string) $flags['dump-yuv'], $res['y'] . $res['u'] . $res['v'], 'YUV planes to');
+}
+
+$report = [
+    'in' => $in,
+    'out' => $out,
+    'source' => $sourceMeta === null ? 'raw rgb' : $sourceMeta->describe(),
+    'quality' => $enc->quality(),
+    'qindex' => $enc->qIndex(),
+    'width' => $w,
+    'height' => $h,
+    'bytes' => strlen($res['webp']),
+    'macroblocks' => $res['mb'],
+    'mb_intra4' => $res['mbIntra4'] ?? null,
+    'prob_updates' => $res['prob_updates'] ?? 0,
+    'alpha_plane' => $alphaPlane === null ? 'none' : 'coded ' . strlen($alphaPlane) . ' B',
+    'alpha_filter' => $alphaPlane === null ? '-' : AlphaCoder::filterName(AlphaCoder::lastFilter()),
+    'icc_bytes' => $enc->iccProfile === null ? 0 : strlen($enc->iccProfile),
+    'seconds_total' => round($loadSeconds + $res['seconds'], 3),
+    'seconds_load' => round($loadSeconds, 3),
+    'seconds_encode' => round($res['seconds'], 3),
+    'peak_mem_mb' => round(memory_get_peak_usage(true) / 1048576, 1),
+];
+
+if (isset($flags['json'])) {
+    echo json_encode($report), "\n";
+} else {
+    foreach ($report as $k => $v) {
+        echo str_pad($k, 20), $v, "\n";
+    }
+}
+exit(0);

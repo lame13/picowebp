@@ -1,0 +1,46 @@
+{
+    "name": "nikocodes/picowebp",
+    "description": "Pure-PHP WebP encoder: writes VP8 lossy WebP bitstreams with no GD, Imagick or libwebp involved.",
+    "homepage": "https://nikocodes.com",
+    "authors": [
+        {
+            "name": "NikoCodes",
+            "homepage": "https://nikocodes.com"
+        }
+    ],
+    "type": "library",
+    "keywords": [
+        "webp",
+        "vp8",
+        "encoder",
+        "image",
+        "lossy",
+        "pure-php"
+    ],
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ext-zlib": "*"
+    },
+    "suggest": {
+        "ext-gd": "Optional. The bundled readers decode PNG and baseline JPEG on their own; GD is only faster where it exists."
+    },
+    "autoload": {
+        "psr-4": {
+            "PicoWebP\\Vp8\\": "src/",
+            "PicoWebP\\Spike\\": "src/Spike/"
+        },
+        "classmap": [
+            "src/"
+        ]
+    },
+    "bin": [
+        "bin/picowebp"
+    ],
+    "scripts": {
+        "test": "php tests/run.php"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
