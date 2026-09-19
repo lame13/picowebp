@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-20
+
+### Fixed
+
+- Cap VP8 chroma DC quantisation at 132 so low-quality output matches the
+  encoder's reconstruction and the decoder's prediction state.
+- Preserve adapted coefficient probabilities across `exportState()` /
+  `importState()`, keeping resumed output byte-identical to single-shot encoding.
+- Decode separate and reordered baseline JPEG scans into the correct component
+  planes, with one block per MCU for single-component scans.
+- Reset PNG transparency keys and JPEG ICC, Adobe colour-transform, and restart
+  settings when a reader instance decodes another image.
+- Make the CLI default to its advertised quality 80, honour `--alpha=fail` for
+  raw alpha planes, and return exit code 1 for invalid reader or encoder input.
+- Report explicitly selected alpha filters correctly and reject invalid filter
+  values, empty alpha dimensions, invalid VP8 dimensions, and RGB buffer lengths.
+- Remove a PHP 8.1+ float-to-integer deprecation from the test fixture and correct
+  stale encoder comments. Add regression coverage for the fixes, including
+  libwebp reconstruction checks and optional `cjpeg` scan fixtures.
+
 ## [1.0.0] - 2026-09-20
 
 First release. picowebp writes VP8 lossy WebP key frames in pure PHP — no GD,
@@ -99,4 +119,5 @@ WebP support at all.
   to 21% larger files on flat logos and UI artwork. The measured tables, and
   what would move them, are in the README.
 
+[1.0.1]: https://github.com/lame13/picowebp/compare/1.0.0...1.0.1
 [1.0.0]: https://github.com/lame13/picowebp/releases/tag/1.0.0

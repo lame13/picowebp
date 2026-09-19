@@ -46,13 +46,20 @@ final class AlphaCoder
      */
     public static function encode(string $plane, int $w, int $h, int $filter = self::FILTER_AUTO): string
     {
+        if ($w < 1 || $h < 1) {
+            throw new \InvalidArgumentException('alpha dimensions must be positive');
+        }
         if (strlen($plane) !== $w * $h) {
             throw new \InvalidArgumentException('alpha plane does not match the display size');
         }
         if ($filter === self::FILTER_AUTO) {
             return self::encodeAuto($plane, $w, $h);
         }
+        if ($filter < self::FILTER_NONE || $filter > self::FILTER_GRADIENT) {
+            throw new \InvalidArgumentException('alpha filter must be auto (-1) or 0..3');
+        }
         $stream = self::stream($plane, $w, $h, $filter);
+        self::$lastFilter = $filter;
 
         // Rsv=0, P=0 (no preprocessing), F=$filter, C=1 (lossless)
         $header = chr(($filter << 2) | 1);
@@ -87,7 +94,7 @@ final class AlphaCoder
         return (string) $best;
     }
 
-    /** The filter that AUTO settled on, for reporting. */
+    /** The filter used by the last successful encode, for reporting. */
     private static int $lastFilter = self::FILTER_NONE;
 
     public static function lastFilter(): int

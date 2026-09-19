@@ -98,8 +98,7 @@ final class BoolEncoder
  * Known simplifications (documented, all bitstream-legal):
  *   - luma uses 16x16 DC/V/H/TM and 4x4 B_PRED; chroma uses DC/V/H/TM only
  *   - no loop filter (loop_filter_level = 0)
- *   - mb_no_skip_coeff = 0, so every macroblock carries residual data
- *   - coefficient probabilities are never updated (defaults are used)
+ *   - optional macroblock skip flags and coefficient probability adaptation
  */
 final class Vp8LossyEncoder
 {
@@ -210,7 +209,7 @@ final class Vp8LossyEncoder
     /**
      * I16-vs-I4 decision bias: a macroblock goes 4x4 only when
      * i4Sad < i16Sad * bpredBias.  1.0 = pure SAD (favours 4x4 on noisy
-     * content, which costs more mode+DC bits); >1 favours the 16x16 modes.
+     * content, which costs more mode+DC bits); >1 favours the 4x4 modes.
      */
     public float $bpredBias = 1.0;
 
@@ -354,17 +353,15 @@ final class Vp8LossyEncoder
      * Emit mb_no_skip_coeff: every macroblock whose coefficients all quantise
      * to zero costs one cheap flag instead of sixteen EOB codes.
      *
-     * Default OFF: prob_skip_false is written once, before any macroblock, so
-     * a one-pass encoder has to guess it.  Measured with a fixed 200/256 it is
-     * a small net loss (see docs/bpred-and-entropy-cleanups.md) on every
-     * fixture; libwebp gets value out of the same flag because it picks the
-     * probability from the frame's own statistics.
+     * Default ON: the probability-adaptation pass derives prob_skip_false
+     * from the frame's own statistics before the final header is written.
+     * Without that pass, skipProb supplies the probability.
      */
     public bool $enableSkipFlags = true;
     /**
      * prob_skip_false, i.e. P(bit 0) = P(the macroblock does have
-     * coefficients).  Fixed rather than adapted: adapting it needs a second
-     * pass over the first partition, which the chunked encoder cannot do.
+     * coefficients). Used as supplied unless deriveSkipProbability() replaces
+     * it after the counting pass.
      */
     public int $skipProb = 128;
     /**
@@ -570,7 +567,8 @@ final class Vp8LossyEncoder
         $clamp = static fn(int $i): int => max(0, min(127, $i));
         $this->qYdc = $dc[$clamp($q + $this->yDcDelta)];
         $this->qYac = $ac[$q];
-        $this->qUvdc = $dc[$clamp($q + $this->uvDcDelta)];
+        // VP8 caps chroma DC at 132, including when a delta is present.
+        $this->qUvdc = min(132, $dc[$clamp($q + $this->uvDcDelta)]);
         $this->qUvac = $ac[$clamp($q + $this->uvAcDelta)];
         $this->qY2dc = $dc[$q] * 2;
         $this->qY2ac = max(8, intdiv($ac[$q] * 155, 100));
@@ -661,6 +659,10 @@ final class Vp8LossyEncoder
     /** Convert an RGB byte string into padded Y/U/V planes. */
     public function loadRgb(string $rgb, int $w, int $h): void
     {
+        self::validateDimensions($w, $h);
+        if (strlen($rgb) !== $w * $h * 3) {
+            throw new \InvalidArgumentException('RGB buffer does not match the display size');
+        }
         $this->w = $w;
         $this->h = $h;
         $this->setupQuantizers();
@@ -1899,6 +1901,7 @@ final class Vp8LossyEncoder
      */
     public function initFrame(int $w, int $h): void
     {
+        self::validateDimensions($w, $h);
         $this->w = $w;
         $this->h = $h;
         // re-derive the quantiser steps: the header deltas may have been set
@@ -2057,12 +2060,21 @@ final class Vp8LossyEncoder
             'statsN0' => $this->probN0,
             'statsN1' => $this->probN1,
             'collectStats' => $this->collectStats,
+            'coeffProbs' => $this->coeffProbs,
         ];
     }
 
     /** @param array<string,mixed> $state */
     public function importState(array $state): void
     {
+        if (array_key_exists('coeffProbs', $state)) {
+            if ($state['coeffProbs'] === null) {
+                $this->coeffProbs = null;
+                $this->probUpdates = 0;
+            } else {
+                $this->setCoeffProbs($state['coeffProbs']);
+            }
+        }
         $this->mbyDone = (int) $state['mbyDone'];
         $this->aboveRow = $state['aboveRow'];
         $this->bAbove = $state['bAbove'] ?? [];
@@ -2081,6 +2093,13 @@ final class Vp8LossyEncoder
             $this->probN0 = $state['statsN0'];
             $this->probN1 = $state['statsN1'];
             $this->collectStats = (bool) ($state['collectStats'] ?? false);
+        }
+    }
+
+    private static function validateDimensions(int $w, int $h): void
+    {
+        if ($w < 1 || $h < 1 || $w > 16383 || $h > 16383) {
+            throw new \InvalidArgumentException('VP8 dimensions must be between 1 and 16383');
         }
     }
 

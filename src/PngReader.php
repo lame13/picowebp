@@ -100,6 +100,8 @@ final class PngReader
         }
         $this->palette = $palette;
         $this->paletteTrns = ($this->colorType === 3 && $trns !== null) ? $trns : '';
+        $this->trnsGrey = -1;
+        $this->trnsRgb = [-1, -1, -1];
 
         // tRNS carries a key colour for colour types 0 and 2, and per-entry
         // alpha for colour type 3.  It is meaningless for types 4 and 6, which

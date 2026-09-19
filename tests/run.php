@@ -22,7 +22,9 @@ foreach (['Vp8Tables', 'AlphaCoder', 'ImageMeta', 'SkippedInput', 'PngReader', '
 use PicoWebP\Vp8\AlphaCoder;
 use PicoWebP\Vp8\ImageInput;
 use PicoWebP\Vp8\ImageMeta;
+use PicoWebP\Vp8\JpegReader;
 use PicoWebP\Vp8\PlaneStore;
+use PicoWebP\Vp8\PngReader;
 use PicoWebP\Vp8\SkippedInput;
 use PicoWebP\Vp8\Vp8LossyEncoder;
 
@@ -98,6 +100,11 @@ function synthAlpha(int $w, int $h): string
     }
 
     return $out;
+}
+
+function pngChunk(string $type, string $data): string
+{
+    return pack('N', strlen($data)) . $type . $data . pack('N', crc32($type . $data));
 }
 
 /** @return array<int,string> chunk fourccs in file order */
@@ -596,6 +603,174 @@ check(
     "exit $status, " . (is_file($cliOut) ? filesize($cliOut) . ' B on disk' : 'no file')
 );
 @unlink($cliOut);
+
+echo "\n8. reader state and baseline JPEG scans\n";
+foreach ([0 => ["\x14", pack('n', 20)], 2 => ["\x14\x28\x3c", pack('n3', 20, 40, 60)]] as $type => [$pixel, $key]) {
+    $head = "\x89PNG\r\n\x1a\n" . pngChunk('IHDR', pack('N2C5', 1, 1, 8, $type, 0, 0, 0));
+    $tail = pngChunk('IDAT', gzcompress("\x00" . $pixel)) . pngChunk('IEND', '');
+    $reader = new PngReader();
+    $transparent = $reader->decode($head . pngChunk('tRNS', $key) . $tail);
+    $plainPng = $head . $tail;
+    $opaque = $reader->decode($plainPng);
+    check("PNG type $type does not inherit the previous transparency key", $transparent['alpha'] === "\x00" && $opaque['alpha'] === null);
+}
+
+if ($haveGd) {
+    // Seed per-image metadata on a one-MCU image. The next JPEG has many
+    // MCUs and no restart markers, profile, or Adobe colour transform.
+    $image = imagecreatetruecolor(8, 8);
+    ob_start();
+    imagejpeg($image);
+    $smallJpeg = (string) ob_get_clean();
+    imagedestroy($image);
+    $iccSegment = "ICC_PROFILE\x00\x01\x01test-profile";
+    $adobeSegment = 'Adobe' . pack('n3C', 100, 0, 0, 0);
+    $taggedJpeg = substr($smallJpeg, 0, 2)
+        . "\xff\xe2" . pack('n', strlen($iccSegment) + 2) . $iccSegment
+        . "\xff\xee" . pack('n', strlen($adobeSegment) + 2) . $adobeSegment
+        . "\xff\xdd\x00\x04\x00\x01" . substr($smallJpeg, 2);
+    $reader = new JpegReader();
+    $reader->decode($taggedJpeg);
+    try {
+        $reused = $reader->decode((string) file_get_contents($jpg));
+        $fresh = JpegReader::read($jpg);
+        check('JPEG reuse resets ICC, colour transform, and restart interval', $reused === $fresh && $reused['icc'] === null);
+    } catch (\InvalidArgumentException $e) {
+        check('JPEG reuse resets ICC, colour transform, and restart interval', false, $e->getMessage());
+    }
+} else {
+    skip('JPEG reader reuse', 'ext-gd missing for fixture generation');
+}
+
+if (trim((string) shell_exec('command -v cjpeg 2>/dev/null')) !== '') {
+    $ppm = $tmp . '/scans.ppm';
+    // Odd dimensions exercise partial component blocks in separate scans.
+    file_put_contents($ppm, "P6\n33 19\n255\n" . synthRgb(33, 19));
+    $scanRgb = [];
+    foreach (['0 1 2;', '0; 1; 2;', '2; 0; 1;'] as $i => $script) {
+        $scanFile = $tmp . '/scans.txt';
+        $jpegFile = $tmp . "/scans-$i.jpg";
+        file_put_contents($scanFile, $script . "\n");
+        exec('cjpeg -quality 90 -restart 2B -scans ' . escapeshellarg($scanFile)
+            . ' -outfile ' . escapeshellarg($jpegFile) . ' ' . escapeshellarg($ppm) . ' 2>&1', $lines, $status);
+        check("baseline JPEG scan fixture $i generated", $status === 0);
+        try {
+            $scanRgb[$i] = JpegReader::read($jpegFile)['rgb'];
+        } catch (\InvalidArgumentException | \RuntimeException $e) {
+            check("baseline JPEG scan fixture $i decoded", false, $e->getMessage());
+        }
+    }
+    check('separate and reordered JPEG scans match interleaved pixels', count($scanRgb) === 3 && $scanRgb[0] === $scanRgb[1] && $scanRgb[0] === $scanRgb[2]);
+} else {
+    skip('separate baseline JPEG scans', 'cjpeg not on PATH');
+}
+
+echo "\n9. encoder boundaries and resumed state\n";
+foreach ([[0, 1], [1, 0], [-1, 1], [16384, 1], [1, 16384]] as [$badW, $badH]) {
+    $rejected = false;
+    try {
+        (new Vp8LossyEncoder())->initFrame($badW, $badH);
+    } catch (\InvalidArgumentException $e) {
+        $rejected = true;
+    }
+    check("invalid VP8 dimensions {$badW}x{$badH} rejected", $rejected);
+}
+$rejected = false;
+try {
+    (new Vp8LossyEncoder())->encode("\x00\x00", 1, 1);
+} catch (\InvalidArgumentException $e) {
+    $rejected = true;
+}
+check('short RGB buffer rejected before reading pixels', $rejected);
+
+// Resume with the same geometry and options in a new object. Adapted odds
+// belong to the frame state and must survive without separate bookkeeping.
+$reference = Vp8LossyEncoder::fromQuality(80);
+$referenceWebp = $reference->encode($rgb, $w, $h)['webp'];
+check('resume fixture has adapted coefficient probabilities', $reference->probUpdates() > 0);
+$resumePng = $tmp . '/resume.png';
+$scanlines = '';
+foreach (str_split($rgb, $w * 3) as $row) {
+    $scanlines .= "\x00" . $row;
+}
+file_put_contents($resumePng, "\x89PNG\r\n\x1a\n"
+    . pngChunk('IHDR', pack('N2C5', $w, $h, 8, 2, 0, 0, 0))
+    . pngChunk('IDAT', gzcompress($scanlines)) . pngChunk('IEND', ''));
+ImageInput::$gdAvailable = false;
+PlaneStore::prepare($resumePng, $tmp . '/resume-work');
+ImageInput::$gdAvailable = null;
+$resumeStore = PlaneStore::open($tmp . '/resume-work');
+$resuming = Vp8LossyEncoder::fromQuality(80);
+$resuming->setCoeffProbs($reference->coeffProbs());
+$resuming->skipProb = $reference->skipProb;
+$resuming->initFrame($w, $h);
+for ($mby = 0; $mby < intdiv($h + 15, 16); $mby++) {
+    $resuming->beginBand($mby, 1, ...$resumeStore->readBand($mby, 1));
+    $resuming->encodeRowRange($mby, 1);
+    $resuming->compactReconWindow();
+    $state = unserialize(serialize($resuming->exportState()));
+    $resuming = Vp8LossyEncoder::fromQuality(80);
+    $resuming->initFrame($w, $h);
+    $resuming->importState($state);
+}
+check('resuming an adapted frame preserves the exact WebP bytes', $resuming->finishFrame()['webp'] === $referenceWebp);
+
+if ($haveDwebp) {
+    $lowRgb = '';
+    for ($i = 0; $i < 3 * 17; $i++) {
+        $lowRgb .= chr(($i * 37) & 255) . chr(($i * 71) & 255) . chr(($i * 13) & 255);
+    }
+    $low = Vp8LossyEncoder::fromQuality(0)->encode($lowRgb, 3, 17);
+    file_put_contents($tmp . '/low.webp', $low['webp']);
+    exec('dwebp -quiet -yuv ' . escapeshellarg($tmp . '/low.webp') . ' -o ' . escapeshellarg($tmp . '/low.yuv') . ' 2>&1', $lines, $status);
+    check('quality 0 reconstruction matches libwebp exactly', $status === 0 && file_get_contents($tmp . '/low.yuv') === Vp8LossyEncoder::displayPlanes($low, 3, 17));
+}
+
+echo "\n10. alpha filters and CLI options\n";
+$smallAlpha = synthAlpha(9, 5);
+foreach ([0, 1, 2, 3] as $filter) {
+    $forced = Vp8LossyEncoder::fromQuality(80);
+    $forced->alphaPlane = $smallAlpha;
+    $forced->alphaFilter = $filter;
+    $forcedWebp = $forced->encode(synthRgb(9, 5), 9, 5)['webp'];
+    check("forced alpha filter $filter is reported correctly", AlphaCoder::lastFilter() === $filter);
+    if ($haveDwebp) {
+        [$pam, $depth] = dwebpPam($forcedWebp, $tmp) ?? ['', 0];
+        check("forced alpha filter $filter round-trips exactly", $depth === 4 && alphaOf(pamBody($pam)) === $smallAlpha);
+    }
+}
+foreach ([-2, 4, 64] as $filter) {
+    $rejected = false;
+    try {
+        AlphaCoder::encode($smallAlpha, 9, 5, $filter);
+    } catch (\InvalidArgumentException $e) {
+        $rejected = true;
+    }
+    check("invalid alpha filter $filter rejected", $rejected);
+}
+
+[$status, $out] = $run($rawPixels, $cliOut, '--rgb=16x16', '--json');
+$report = json_decode($out, true);
+$defaultWebp = (string) file_get_contents($cliOut);
+[$explicitStatus] = $run($rawPixels, $cliOut, '--rgb=16x16', '--quality=80', '--json');
+check('CLI default is the advertised quality 80', $status === 0 && $explicitStatus === 0 && ($report['quality'] ?? null) === 80 && $defaultWebp === file_get_contents($cliOut));
+[$status, $out] = $run($rawPixels, $cliOut, '40', '--rgb=16x16', '--json');
+$report = json_decode($out, true);
+check('explicit positional qindex remains supported', $status === 0 && ($report['qindex'] ?? null) === 40);
+
+$rawAlpha = $tmp . '/alpha.raw';
+file_put_contents($rawAlpha, synthAlpha(16, 16));
+$sentinel = 'existing output';
+file_put_contents($cliOut, $sentinel);
+[$status, $text] = $stderrRun($rawPixels, $cliOut, '--rgb=16x16', '--alpha-plane=' . $rawAlpha, '--alpha=fail');
+check('raw alpha obeys --alpha=fail without overwriting output', $status === 3 && file_get_contents($cliOut) === $sentinel);
+[$status, $text] = $stderrRun($rawPixels, $cliOut, '--rgb=16x16', '--alpha-plane=' . $rawAlpha, '--alpha-filter=4');
+check('invalid alpha filter exits 1 without a fatal error or output change', $status === 1 && !str_contains($text, 'Fatal error') && file_get_contents($cliOut) === $sentinel);
+
+$brokenPng = $tmp . '/truncated.png';
+file_put_contents($brokenPng, substr($plainPng, 0, -12));
+[$status, $text] = $stderrRun($brokenPng, $cliOut, '--no-gd');
+check('malformed bundled input exits 1 with a concise error', $status === 1 && str_contains($text, 'missing IEND') && !str_contains($text, 'Fatal error') && file_get_contents($cliOut) === $sentinel);
 
 rmTree($tmp);
 

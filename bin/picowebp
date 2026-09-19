@@ -173,12 +173,17 @@ if (isset($flags['rgb'])) {
     } catch (SkippedInput $e) {
         // Backstop for anything above that skipped without asking first.
         exit($reportSkipped($e->meta ?? ImageMeta::read($in), $in, $out, isset($flags['json'])));
-    } catch (\RuntimeException $e) {
+    } catch (\RuntimeException | \InvalidArgumentException $e) {
         fwrite(STDERR, $e->getMessage() . "\n");
         exit(1);
     }
 }
 $loadSeconds = microtime(true) - $tLoad;
+
+if ($alphaMode === 'fail' && $alphaPlane !== null) {
+    fwrite(STDERR, "image has an alpha channel and --alpha=fail was requested\n");
+    exit(3);
+}
 
 if ($alphaMode === 'flatten') {
     $alphaPlane = null;
@@ -195,9 +200,9 @@ if (isset($flags['icc'])) {
     $icc = $sourceIcc;
 }
 
-$enc = $qIndex === null && isset($flags['quality'])
-    ? Vp8LossyEncoder::fromQuality((int) $flags['quality'])
-    : new Vp8LossyEncoder($qIndex ?? 40);
+$enc = $qIndex === null
+    ? Vp8LossyEncoder::fromQuality((int) ($flags['quality'] ?? 80))
+    : new Vp8LossyEncoder($qIndex);
 
 $toggles = [
     'no-bpred' => ['enableBPred', false],
@@ -252,7 +257,12 @@ if (isset($flags['alpha-filter'])) {
     $enc->alphaFilter = (int) $flags['alpha-filter'];
 }
 
-$res = $enc->encode($rgb, $w, $h);
+try {
+    $res = $enc->encode($rgb, $w, $h);
+} catch (\RuntimeException | \InvalidArgumentException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
 
 /**
  * Write a file, all of it or none of it, and say so on stderr.

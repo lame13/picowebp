@@ -220,6 +220,13 @@ final class JpegReader
         $this->components = [];
         $this->order = [];
         $this->planes = [];
+        $this->planeW = [];
+        $this->planeH = [];
+        $this->restartInterval = 0;
+        $this->icc = null;
+        $this->adobe = false;
+        $this->adobeTransform = -1;
+        $this->bit = null;
         $this->width = 0;
         $this->height = 0;
         $this->maxH = 1;
@@ -417,10 +424,6 @@ final class JpegReader
             $this->components[$id]['td'] = $tables >> 4;
             $this->components[$id]['ta'] = $tables & 15;
         }
-        foreach ($scan as $index => $id) {
-            $this->components[$id]['scanIndex'] = $index;
-        }
-
         $clean = '';
         $n = strlen($bytes);
         while ($position < $n) {
@@ -458,6 +461,12 @@ final class JpegReader
     {
         $mcuW = intdiv($this->width + 8 * $this->maxH - 1, 8 * $this->maxH);
         $mcuH = intdiv($this->height + 8 * $this->maxV - 1, 8 * $this->maxV);
+        $interleaved = count($scan) > 1;
+        if (!$interleaved) {
+            $index = array_search($scan[0], $this->order, true);
+            $mcuW = intdiv($this->planeW[$index] + 7, 8);
+            $mcuH = intdiv($this->planeH[$index] + 7, 8);
+        }
         $huffDc = [];
         $huffAc = [];
         $quant = [];
@@ -485,11 +494,15 @@ final class JpegReader
                 }
                 foreach ($scan as $id) {
                     $component = $this->components[$id];
-                    $index = $component['scanIndex'];
-                    for ($v = 0; $v < $component['v']; $v++) {
-                        for ($h = 0; $h < $component['h']; $h++) {
-                            $bx = $mx * $component['h'] + $h;
-                            $by = $my * $component['v'] + $v;
+                    $index = array_search($id, $this->order, true);
+                    // A single-component scan has one block per MCU, even
+                    // when that component has larger sampling factors.
+                    $blocksH = $interleaved ? $component['h'] : 1;
+                    $blocksV = $interleaved ? $component['v'] : 1;
+                    for ($v = 0; $v < $blocksV; $v++) {
+                        for ($h = 0; $h < $blocksH; $h++) {
+                            $bx = $mx * $blocksH + $h;
+                            $by = $my * $blocksV + $v;
                             $block = $this->decodeBlock($huffDc[$id], $huffAc[$id], $quant[$id], $predictors[$id]);
                             $predictors[$id] = $block['dc'];
                             $this->storeBlock($index, $bx, $by, $block['samples']);
