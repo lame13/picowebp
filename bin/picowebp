@@ -4,9 +4,9 @@
 declare(strict_types=1);
 
 /**
- * picowebp CLI: encode a PNG, JPEG or raw RGB buffer to lossy WebP.
+ * picowebp CLI: encode a PNG, JPEG, BMP or raw RGB buffer to lossy WebP.
  *
- *   picowebp <in.png|in.jpg|in.raw> <out.webp> [qindex] [options]
+ *   picowebp <in.png|in.jpg|in.bmp|in.raw> <out.webp> [qindex] [options]
  *
  * A WebP input is detected by content and skipped: it is already the format
  * this writes.  That is not an error, it is exit code 4 and no output file.
@@ -22,7 +22,7 @@ if (is_file($vendored)) {
 }
 // Self-contained fallback: the library files require_once each other, so this
 // is a no-op when Composer's autoloader already found them.
-foreach (['Vp8Tables', 'AlphaCoder', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput'] as $file) {
+foreach (['Vp8Tables', 'AlphaCoder', 'BmpReader', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput'] as $file) {
     require_once $root . '/src/' . $file . '.php';
 }
 
@@ -33,7 +33,7 @@ use PicoWebP\Vp8\SkippedInput;
 use PicoWebP\Vp8\Vp8LossyEncoder;
 
 $usage = <<<'TXT'
-usage: picowebp <in.png|in.jpg|in.raw> <out.webp> [qindex] [options]
+usage: picowebp <in.png|in.jpg|in.bmp|in.raw> <out.webp> [qindex] [options]
 
   --quality=0..100      quality, mapped to the VP8 quantiser (default 80)
   --rgb=WxH             read the input as headerless 8-bit RGB, no GD involved
@@ -43,7 +43,7 @@ usage: picowebp <in.png|in.jpg|in.raw> <out.webp> [qindex] [options]
   --alpha-filter=0..3   force an ALPH prediction filter (default: pick one)
   --icc=FILE            write this ICC profile instead of the source's
   --no-icc              drop the source's ICC profile
-  --bundled             use the bundled PNG/JPEG readers even if GD is installed
+  --bundled             use the bundled PNG/JPEG/BMP readers even if GD is installed
   --no-gd               refuse to use GD at all
   --reencode-webp       re-encode a WebP source instead of skipping it
                         (needs GD: nothing here decodes WebP without it)

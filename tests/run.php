@@ -15,11 +15,12 @@ $vendored = $root . '/vendor/autoload.php';
 if (is_file($vendored)) {
     require_once $vendored;
 }
-foreach (['Vp8Tables', 'AlphaCoder', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput', 'PlaneStore'] as $file) {
+foreach (['Vp8Tables', 'AlphaCoder', 'BmpReader', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput', 'PlaneStore'] as $file) {
     require_once $root . '/src/' . $file . '.php';
 }
 
 use PicoWebP\Vp8\AlphaCoder;
+use PicoWebP\Vp8\BmpReader;
 use PicoWebP\Vp8\ImageInput;
 use PicoWebP\Vp8\ImageMeta;
 use PicoWebP\Vp8\JpegReader;
@@ -105,6 +106,72 @@ function synthAlpha(int $w, int $h): string
 function pngChunk(string $type, string $data): string
 {
     return pack('N', strlen($data)) . $type . $data . pack('N', crc32($type . $data));
+}
+
+/**
+ * Assemble a BMP around a caller-built pixel payload, for the fixtures this
+ * suite needs: the 12-byte OS/2 core header, BITMAPINFOHEADER, and the V2–V5
+ * headers that add channel masks and an embedded profile.
+ *
+ * The three header fields that matter for the geometry — the file size, the
+ * pixel offset and the profile offset — are computed here, so a fixture can
+ * only be wrong on purpose ($opts['offBits']).
+ *
+ * @param array<string,mixed> $opts dibSize, compression, masks, extra, palette, clrUsed,
+ *                                  topDown, cstype, profile, profileFromDib, offBits
+ */
+function buildBmp(int $w, int $h, int $bits, string $payload, array $opts = []): string
+{
+    $dibSize = (int) ($opts['dibSize'] ?? 40);
+    $core = $dibSize === 12;
+    $compression = (int) ($opts['compression'] ?? 0);
+    $masks = $opts['masks'] ?? [0, 0, 0, 0];
+    $extra = (string) ($opts['extra'] ?? '');
+    $palette = (string) ($opts['palette'] ?? '');
+    $profile = (string) ($opts['profile'] ?? '');
+    $clrUsed = (int) ($opts['clrUsed'] ?? 0);
+    $topDown = (bool) ($opts['topDown'] ?? false);
+    $offBits = (int) ($opts['offBits'] ?? (14 + $dibSize + strlen($extra) + strlen($palette)));
+    // bV5ProfileData is documented as an offset from the DIB header; plenty of
+    // writers store an absolute file offset instead.  Both get tested.
+    $profileAt = $offBits + strlen($payload) - (($opts['profileFromDib'] ?? false) ? 14 : 0);
+
+    if ($core) {
+        $dib = pack('Vvvvv', 12, $w, $h, 1, $bits);
+    } else {
+        $dib = pack('V', $dibSize) . pack(
+            'VVvvVVVVVV',
+            $w,
+            ($topDown ? -$h : $h) & 0xFFFFFFFF,
+            1,
+            $bits,
+            $compression,
+            0,
+            0,
+            0,
+            $clrUsed,
+            0
+        );
+        if ($dibSize >= 52) {
+            $dib .= pack('V3', $masks[0], $masks[1], $masks[2]);
+        }
+        if ($dibSize >= 56) {
+            $dib .= pack('V', $masks[3]);
+        }
+        if ($dibSize >= 108) {
+            // The colour-space tag is a four-byte field, not the name MSDN
+            // spells it with: LCS_sRGB is the DWORD 'sRGB', which on disk is
+            // BGRs.  Only the embedded-profile tag means anything here.
+            $dib .= ($opts['cstype'] ?? 'BGRs') . str_repeat("\x00", 48);
+        }
+        if ($dibSize >= 124) {
+            $dib .= pack('VVVV', 0, $profile === '' ? 0 : $profileAt, strlen($profile), 0);
+        }
+    }
+
+    $body = $dib . $extra . $palette . $payload . $profile;
+
+    return 'BM' . pack('VvvV', 14 + strlen($body), 0, 0, $offBits) . $body;
 }
 
 /** @return array<int,string> chunk fourccs in file order */
@@ -771,6 +838,520 @@ $brokenPng = $tmp . '/truncated.png';
 file_put_contents($brokenPng, substr($plainPng, 0, -12));
 [$status, $text] = $stderrRun($brokenPng, $cliOut, '--no-gd');
 check('malformed bundled input exits 1 with a concise error', $status === 1 && str_contains($text, 'missing IEND') && !str_contains($text, 'Fatal error') && file_get_contents($cliOut) === $sentinel);
+
+echo "\n11. BMP input\n";
+// A 5x3 source with an odd width, so every 24-bit row has padding to skip.
+$bw = 5;
+$bh = 3;
+$bmpRgb = '';
+$bmpAlpha = '';
+for ($y = 0; $y < $bh; $y++) {
+    for ($x = 0; $x < $bw; $x++) {
+        $bmpRgb .= chr(10 + $x * 7) . chr(20 + $y * 11) . chr(190 - $x * 3 - $y);
+        $bmpAlpha .= chr(255 - ($x + $y) * 13);
+    }
+}
+/** One stored row, in BMP's own channel order: blue, green, red. */
+$row24 = static function (int $y) use ($bmpRgb, $bw): string {
+    $row = '';
+    for ($x = 0; $x < $bw; $x++) {
+        $o = ($y * $bw + $x) * 3;
+        $row .= $bmpRgb[$o + 2] . $bmpRgb[$o + 1] . $bmpRgb[$o];
+    }
+
+    return $row . str_repeat("\x00", (4 - strlen($row) % 4) % 4);
+};
+$bottomUp = '';
+$topRows = '';
+for ($y = $bh - 1; $y >= 0; $y--) {
+    $bottomUp .= $row24($y);
+}
+for ($y = 0; $y < $bh; $y++) {
+    $topRows .= $row24($y);
+}
+
+$bmp24 = $tmp . '/plain.bmp';
+file_put_contents($bmp24, buildBmp($bw, $bh, 24, $bottomUp));
+$bmpMeta = ImageMeta::read($bmp24);
+check(
+    'a BMP is recognised from its bytes',
+    $bmpMeta->type === IMAGETYPE_BMP && $bmpMeta->width === $bw && $bmpMeta->height === $bh
+);
+check('describe() names the layout', $bmpMeta->describe() === 'bmp 24bpp rgb', $bmpMeta->describe());
+check('a 24-bit BMP is opaque', !$bmpMeta->mayHaveAlpha());
+check('rows are unpadded, bottom-up and in RGB order', BmpReader::read($bmp24)['rgb'] === $bmpRgb);
+
+$bmpTop = $tmp . '/top-down.bmp';
+file_put_contents($bmpTop, buildBmp($bw, $bh, 24, $topRows, ['topDown' => true]));
+check('a negative height means top-down rows', BmpReader::read($bmpTop)['rgb'] === $bmpRgb);
+
+$viaInput = ImageInput::pixels($bmp24);
+check(
+    'ImageInput reads BMP with its own reader, GD or not',
+    $viaInput['reader'] === 'bundled' && $viaInput['rgb'] === $bmpRgb && $viaInput['alpha'] === null
+);
+ImageInput::$gdAvailable = false;
+$withoutGd = ImageInput::pixels($bmp24);
+ImageInput::$gdAvailable = null;
+check('and produces the same pixels with GD switched off', $withoutGd['rgb'] === $bmpRgb);
+
+$bmpWebp = Vp8LossyEncoder::fromQuality(80)->encode($viaInput['rgb'], $bw, $bh)['webp'];
+check('a BMP encodes to the same bytes as its pixels', $bmpWebp === Vp8LossyEncoder::fromQuality(80)->encode($bmpRgb, $bw, $bh)['webp']);
+
+// 32-bit BGRA behind a V4 header: the alpha mask is what makes it translucent.
+$bgra = '';
+$zeroAlpha = '';
+$bgrx = '';
+for ($y = $bh - 1; $y >= 0; $y--) {
+    for ($x = 0; $x < $bw; $x++) {
+        $o = ($y * $bw + $x) * 3;
+        $bgra .= $bmpRgb[$o + 2] . $bmpRgb[$o + 1] . $bmpRgb[$o] . $bmpAlpha[$y * $bw + $x];
+        $zeroAlpha .= $bmpRgb[$o + 2] . $bmpRgb[$o + 1] . $bmpRgb[$o] . "\x00";
+        $bgrx .= $bmpRgb[$o + 2] . $bmpRgb[$o + 1] . $bmpRgb[$o] . "\x5a";
+    }
+}
+$alphaMasks = [0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000];
+
+$bmp32 = $tmp . '/alpha32.bmp';
+file_put_contents($bmp32, buildBmp($bw, $bh, 32, $bgra, ['dibSize' => 108, 'compression' => 3, 'masks' => $alphaMasks]));
+$decoded32 = BmpReader::read($bmp32);
+check('a V4 header alpha mask is decoded', $decoded32['rgb'] === $bmpRgb && $decoded32['alpha'] === $bmpAlpha);
+check('ImageMeta reports the alpha channel', ImageMeta::read($bmp32)->mayHaveAlpha());
+check('describe() says which layout it is', ImageMeta::read($bmp32)->describe() === 'bmp 32bpp bitfields alpha', ImageMeta::read($bmp32)->describe());
+
+$bmpZero = $tmp . '/zero-alpha.bmp';
+file_put_contents($bmpZero, buildBmp($bw, $bh, 32, $zeroAlpha, ['dibSize' => 108, 'compression' => 3, 'masks' => $alphaMasks]));
+check('a declared all-zero alpha channel stays transparent', BmpReader::read($bmpZero)['alpha'] === str_repeat("\x00", $bw * $bh));
+
+$bmpOpaque = $tmp . '/opaque-alpha.bmp';
+file_put_contents($bmpOpaque, buildBmp(1, 1, 32, "\x30\x20\x10\xff", [
+    'dibSize' => 108, 'compression' => 3, 'masks' => $alphaMasks,
+]));
+check('a fully opaque BMP does not return an alpha plane', ImageInput::pixels($bmpOpaque)['alpha'] === null);
+
+$bmp32x = $tmp . '/bgrx.bmp';
+file_put_contents($bmp32x, buildBmp($bw, $bh, 32, $bgrx));
+$decoded32x = BmpReader::read($bmp32x);
+check('32-bit BI_RGB ignores its fourth byte', $decoded32x['alpha'] === null && $decoded32x['rgb'] === $bmpRgb);
+
+$bmpRgbMasks = $tmp . '/rgb-unused-masks.bmp';
+file_put_contents($bmpRgbMasks, buildBmp(1, 1, 32, "\x30\x20\x10\x80", [
+    'dibSize' => 108, 'masks' => [0xff, 0xff00, 0xff0000, 0xff000000],
+]));
+$unusedMasks = ImageInput::pixels($bmpRgbMasks);
+check(
+    'BI_RGB ignores V4 masks and keeps BGRX opaque',
+    $unusedMasks['rgb'] === "\x10\x20\x30" && $unusedMasks['alpha'] === null
+        && !ImageMeta::read($bmpRgbMasks)->mayHaveAlpha()
+);
+
+// The same alpha masks behind a 40-byte header, where they live in the block
+// that follows it rather than in the header itself.
+$bmpAbf = $tmp . '/alpha-out-of-band.bmp';
+file_put_contents($bmpAbf, buildBmp($bw, $bh, 32, $bgra, [
+    'compression' => 6,
+    'extra' => pack('V4', ...$alphaMasks),
+]));
+$decodedAbf = BmpReader::read($bmpAbf);
+check('masks stored behind a 40-byte header work too', $decodedAbf['rgb'] === $bmpRgb && $decodedAbf['alpha'] === $bmpAlpha);
+
+// Palette images at every depth, including an index past the end of the
+// palette — viewers paint that black, and so does this reader.
+$palette = [];
+for ($i = 0; $i < 16; $i++) {
+    $palette[$i] = chr(5 + $i * 15) . chr(240 - $i * 15) . chr($i * 7);
+}
+$paletteBytes = '';
+foreach ($palette as $triple) {
+    $paletteBytes .= $triple[2] . $triple[1] . $triple[0] . "\x00";
+}
+$corePaletteBytes = '';
+foreach (array_slice($palette, 0, 8, true) as $triple) {
+    $corePaletteBytes .= $triple[2] . $triple[1] . $triple[0];
+}
+$paletteRgb = static function (array $rows) use ($palette): string {
+    $out = '';
+    foreach ($rows as $row) {
+        foreach ($row as $index) {
+            $out .= $palette[$index] ?? "\x00\x00\x00";
+        }
+    }
+
+    return $out;
+};
+
+$rows8 = [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [1, 1, 2, 2, 99]];
+$payload8 = '';
+for ($y = $bh - 1; $y >= 0; $y--) {
+    foreach ($rows8[$y] as $index) {
+        $payload8 .= chr($index);
+    }
+    $payload8 .= str_repeat("\x00", (4 - $bw % 4) % 4);
+}
+$bmp8 = $tmp . '/palette8.bmp';
+file_put_contents($bmp8, buildBmp($bw, $bh, 8, $payload8, ['palette' => $paletteBytes]));
+$decoded8 = BmpReader::read($bmp8);
+check('an 8-bit palette BMP resolves through its palette', $decoded8['rgb'] === $paletteRgb($rows8));
+check(
+    'an index past the palette is black, not a fatal error',
+    substr($decoded8['rgb'], ($bh - 1) * $bw * 3 + ($bw - 1) * 3, 3) === "\x00\x00\x00"
+);
+
+$bmpCore = $tmp . '/core-header.bmp';
+file_put_contents($bmpCore, buildBmp($bw, $bh, 8, $payload8, ['dibSize' => 12, 'palette' => $corePaletteBytes]));
+check('the OS/2 core header, with three-byte palette entries, works', BmpReader::read($bmpCore)['rgb'] === $paletteRgb($rows8));
+
+$rows4 = [[0, 1, 2, 3, 4], [4, 2, 0, 3, 1], [1, 0, 4, 2, 3]];
+$payload4 = '';
+for ($y = $bh - 1; $y >= 0; $y--) {
+    $row = '';
+    for ($i = 0; $i < $bw; $i += 2) {
+        $row .= chr(($rows4[$y][$i] << 4) | ($rows4[$y][$i + 1] ?? 0));
+    }
+    $payload4 .= $row . str_repeat("\x00", (4 - strlen($row) % 4) % 4);
+}
+$bmp4 = $tmp . '/palette4.bmp';
+file_put_contents($bmp4, buildBmp($bw, $bh, 4, $payload4, ['palette' => $paletteBytes]));
+check('4-bit rows unpack high nibble first', BmpReader::read($bmp4)['rgb'] === $paletteRgb($rows4));
+
+$rows1 = [[1, 0, 1, 0, 1], [0, 0, 1, 1, 0], [1, 1, 1, 0, 0]];
+$payload1 = '';
+for ($y = $bh - 1; $y >= 0; $y--) {
+    $byte = 0;
+    for ($i = 0; $i < $bw; $i++) {
+        if ($rows1[$y][$i] === 1) {
+            $byte |= 1 << (7 - $i);
+        }
+    }
+    $payload1 .= chr($byte) . str_repeat("\x00", 3);
+}
+$bmp1 = $tmp . '/palette1.bmp';
+file_put_contents($bmp1, buildBmp($bw, $bh, 1, $payload1, ['palette' => $paletteBytes]));
+check('1-bit rows unpack most significant bit first', BmpReader::read($bmp1)['rgb'] === $paletteRgb($rows1));
+
+// 16-bit samples.  BMP does not fix how a 5- or 6-bit channel widens to a
+// byte, so the expectation is built with the same nearest-step rule the reader
+// documents, and the ImageMagick comparison below allows one step of slack.
+$widen5 = static fn (int $v): int => intdiv($v * 255 + 15, 31);
+$widen6 = static fn (int $v): int => intdiv($v * 255 + 31, 63);
+$samples555 = [[3, 5, 7], [31, 0, 12], [0, 31, 1], [17, 17, 17], [9, 27, 4]];
+$payload555 = '';
+for ($i = 0; $i < $bw; $i++) {
+    [$r5, $g5, $b5] = $samples555[$i];
+    $payload555 .= pack('v', ($r5 << 10) | ($g5 << 5) | $b5);
+}
+$payload555 .= str_repeat("\x00", (4 - ($bw * 2) % 4) % 4);
+$expect555 = '';
+foreach ($samples555 as [$r5, $g5, $b5]) {
+    $expect555 .= chr($widen5($r5)) . chr($widen5($g5)) . chr($widen5($b5));
+}
+$bmp555 = $tmp . '/rgb555.bmp';
+file_put_contents($bmp555, buildBmp($bw, 1, 16, $payload555));
+check('16-bit BI_RGB defaults to 5-5-5', BmpReader::read($bmp555)['rgb'] === $expect555);
+
+$samples565 = [[5, 12, 9], [31, 63, 0], [0, 0, 31], [21, 40, 17], [1, 62, 30]];
+$payload565 = '';
+for ($i = 0; $i < $bw; $i++) {
+    [$r5, $g6, $b5] = $samples565[$i];
+    $payload565 .= pack('v', ($r5 << 11) | ($g6 << 5) | $b5);
+}
+$payload565 .= str_repeat("\x00", (4 - ($bw * 2) % 4) % 4);
+$expect565 = '';
+foreach ($samples565 as [$r5, $g6, $b5]) {
+    $expect565 .= chr($widen5($r5)) . chr($widen6($g6)) . chr($widen5($b5));
+}
+$bmp565 = $tmp . '/rgb565.bmp';
+file_put_contents($bmp565, buildBmp($bw, 1, 16, $payload565, [
+    'compression' => 3,
+    'extra' => pack('V3', 0xF800, 0x07E0, 0x001F),
+]));
+check('16-bit BI_BITFIELDS honours 5-6-5 masks', BmpReader::read($bmp565)['rgb'] === $expect565);
+
+// RLE8: an encoded run, an end-of-line, an absolute run with its pad byte, a
+// delta jump and an explicit end of bitmap.  Rows run bottom-up.
+$rowsRle8 = [[4, 0, 0, 0, 0], [3, 3, 3, 3, 3], [1, 1, 1, 1, 2]];
+$bmpRle8 = $tmp . '/rle8.bmp';
+file_put_contents($bmpRle8, buildBmp($bw, $bh, 8, "\x04\x01\x01\x02\x00\x00"
+    . "\x05\x03\x00\x00"
+    . "\x00\x05\x04\x00\x00\x00\x00\x00\x00\x00"
+    . "\x00\x01", ['compression' => 1, 'palette' => $paletteBytes]));
+check('BI_RLE8 runs, absolute runs and row changes decode', BmpReader::read($bmpRle8)['rgb'] === $paletteRgb($rowsRle8));
+
+// One pixel at the left of the bottom row, then a jump up and right of it.
+$rowsDelta = [[0, 0, 0, 0, 0], [0, 0, 2, 2, 0], [1, 0, 0, 0, 0]];
+$bmpDelta = $tmp . '/rle8-delta.bmp';
+file_put_contents($bmpDelta, buildBmp($bw, $bh, 8, "\x01\x01"
+    . "\x00\x02\x01\x01"
+    . "\x02\x02\x00\x00"
+    . "\x00\x01", ['compression' => 1, 'palette' => $paletteBytes]));
+check('an RLE8 delta jump lands where it says', BmpReader::read($bmpDelta)['rgb'] === $paletteRgb($rowsDelta));
+
+$rowsRle4 = [[0, 10, 0, 10, 0], [1, 2, 3, 4, 5], [0, 0, 0, 0, 0]];
+$bmpRle4 = $tmp . '/rle4.bmp';
+file_put_contents($bmpRle4, buildBmp($bw, 2, 4, "\x00\x05\x12\x34\x50\x00\x00\x00"
+    . "\x05\x0a\x00\x00\x00\x01", ['compression' => 2, 'palette' => $paletteBytes]));
+check('BI_RLE4 alternates its nibbles', BmpReader::read($bmpRle4)['rgb'] === $paletteRgb(array_slice($rowsRle4, 0, 2)));
+
+// A V5 header profile.  The payload has to look like a real profile: the
+// reader checks the signature before believing the header's offset.
+$profile = pack('N', 200) . str_repeat("\x00", 32) . 'acsp' . str_repeat("\x1f", 160);
+$bmpIcc = $tmp . '/icc.bmp';
+file_put_contents($bmpIcc, buildBmp($bw, $bh, 24, $bottomUp, ['dibSize' => 124, 'cstype' => 'MBED', 'profile' => $profile]));
+check("a V5 header's embedded profile is read from the header", ImageMeta::read($bmpIcc)->icc === $profile);
+check('and reaches the encoder path', ImageInput::pixels($bmpIcc)['icc'] === $profile);
+
+$bmpIccDib = $tmp . '/icc-from-dib.bmp';
+file_put_contents($bmpIccDib, buildBmp($bw, $bh, 24, $bottomUp, [
+    'dibSize' => 124,
+    'cstype' => 'MBED',
+    'profile' => $profile,
+    'profileFromDib' => true,
+]));
+check('both bases for the profile offset are accepted', ImageInput::pixels($bmpIccDib)['icc'] === $profile);
+
+// A V4/V5 header written once for every depth carries an alpha mask on 24-bit
+// files too, where there is no fourth byte for it to describe.
+$bmp24V5 = $tmp . '/24bit-v5-mask.bmp';
+file_put_contents($bmp24V5, buildBmp($bw, $bh, 24, $bottomUp, [
+    'dibSize' => 124,
+    'compression' => 3,
+    'masks' => $alphaMasks,
+]));
+$maskedMeta = ImageMeta::read($bmp24V5);
+check(
+    'an alpha mask on a 24-bit header is not a promise of transparency',
+    !$maskedMeta->mayHaveAlpha() && $maskedMeta->describe() === 'bmp 24bpp bitfields',
+    $maskedMeta->describe()
+);
+check('and the pixels still decode', BmpReader::read($bmp24V5)['rgb'] === $bmpRgb && BmpReader::read($bmp24V5)['alpha'] === null);
+
+$bmp24Unused = $tmp . '/24bit-unused-masks.bmp';
+file_put_contents($bmp24Unused, buildBmp(1, 1, 24, "\x30\x20\x10\x00", [
+    'dibSize' => 108, 'compression' => 3, 'masks' => [0xff, 0xff00, 0xff0000, 0],
+]));
+$warnings = [];
+set_error_handler(static function (int $severity, string $message) use (&$warnings): bool {
+    $warnings[] = $message;
+    return true;
+});
+try {
+    $unused24 = BmpReader::read($bmp24Unused);
+} finally {
+    restore_error_handler();
+}
+check('24-bit pixels remain BGR even with unused channel masks', $unused24['rgb'] === "\x10\x20\x30" && $warnings === []);
+
+// The V4 header stops at byte 122. Bytes at the V5 profile-field offsets are
+// pixels here, even if they happen to point to something resembling an ICC.
+$bmpV4Profile = $tmp . '/v4-false-profile.bmp';
+file_put_contents($bmpV4Profile, buildBmp(4, 1, 24,
+    str_repeat("\x00", 4) . pack('VV', 134, strlen($profile)),
+    ['dibSize' => 108, 'cstype' => 'DEBM']
+) . $profile);
+check(
+    'a V4 header cannot claim a V5 embedded profile',
+    ImageMeta::read($bmpV4Profile)->icc === null && BmpReader::read($bmpV4Profile)['icc'] === null
+);
+
+// The staged queue path reads through the same chooser, so a BMP job has to
+// come out with the single-shot bytes and its alpha intact.  Adaptation is off
+// for both, exactly as the other staged comparisons do it: the question here
+// is whether the staged pixels match, not how the probabilities are derived.
+$reference32 = Vp8LossyEncoder::fromQuality(80);
+$reference32->adaptProbs = false;
+$reference32->alphaPlane = $bmpAlpha;
+$reference32Webp = $reference32->encode($bmpRgb, $bw, $bh)['webp'];
+PlaneStore::prepare($bmp32, $tmp . '/bmp-work');
+$bmpStore = PlaneStore::open($tmp . '/bmp-work');
+$bmpMbRows = (int) $bmpStore->meta()['mbh'];
+$staged32 = Vp8LossyEncoder::fromQuality(80);
+$staged32->adaptProbs = false;
+$staged32->alphaPlane = $bmpStore->alphaPlane();
+$staged32->initFrame($bw, $bh);
+$staged32->beginBand(0, $bmpMbRows, ...$bmpStore->readBand(0, $bmpMbRows));
+$staged32->encodeRowRange(0, $bmpMbRows);
+$staged32Webp = $staged32->finishFrame()['webp'];
+check(
+    'the staged queue path reads a translucent BMP byte for byte',
+    $staged32Webp === $reference32Webp,
+    md5($staged32Webp) . ' vs ' . md5($reference32Webp)
+);
+
+// The CLI is what a queue calls, so the BMP path is checked from there too.
+@unlink($cliOut);
+[$status, $out] = $run($bmp24, $cliOut, '--json', '--no-gd');
+$report = json_decode($out, true);
+check(
+    'CLI encodes a BMP with GD switched off',
+    $status === 0 && is_file($cliOut) && ($report['source'] ?? '') === 'bmp 24bpp rgb',
+    "exit $status, source " . ($report['source'] ?? '-')
+);
+check('and writes exactly the bytes the encoder produced', is_file($cliOut) && file_get_contents($cliOut) === $bmpWebp);
+@unlink($cliOut);
+
+file_put_contents($cliOut, 'existing output');
+[$status, $text] = $stderrRun($bmp32, $cliOut, '--alpha=fail', '--no-gd');
+check(
+    'a translucent BMP obeys --alpha=fail without overwriting the output',
+    $status === 3 && file_get_contents($cliOut) === 'existing output',
+    "exit $status"
+);
+[$status, $out] = $run($bmp32, $cliOut, '--json', '--no-gd');
+$report = json_decode($out, true);
+check(
+    'and encodes with its alpha plane when left alone',
+    $status === 0 && ($report['alpha_plane'] ?? '') === 'coded ' . $bw * $bh . ' B' && webpChunks((string) file_get_contents($cliOut)) === ['VP8X', 'ALPH', 'VP8 '],
+    implode(' ', webpChunks((string) file_get_contents($cliOut)))
+);
+@unlink($cliOut);
+
+[$status, $out] = $run($bmpZero, $cliOut, '--json', '--no-gd');
+$zeroReport = json_decode($out, true);
+check(
+    'CLI keeps a fully transparent BMP alpha plane',
+    $status === 0 && ($zeroReport['alpha_plane'] ?? '') === 'coded ' . $bw * $bh . ' B'
+        && in_array('ALPH', webpChunks((string) file_get_contents($cliOut)), true)
+);
+@unlink($cliOut);
+
+// Malformed input: a truncated payload, a bitmap that wraps a JPEG, a file
+// that merely begins with "BM", and one too large to encode.
+$truncatedBmp = $tmp . '/truncated.bmp';
+file_put_contents($truncatedBmp, buildBmp($bw, $bh, 24, substr($bottomUp, 0, 6)));
+[$status, $text] = $stderrRun($truncatedBmp, $cliOut, '--no-gd');
+check(
+    'a truncated BMP exits 1 and says why',
+    $status === 1 && str_contains($text, 'truncated BMP pixel data') && !str_contains($text, 'Fatal error'),
+    trim($text)
+);
+
+// An incomplete RLE command must fail before the CLI replaces an old output.
+$truncatedRle = $tmp . '/truncated-rle.bmp';
+foreach ([
+    'RLE8 count' => [8, 1, "\x03"],
+    'RLE8 delta' => [8, 1, "\x00\x02\x01"],
+    'RLE8 literals' => [8, 1, "\x00\x03\x01"],
+    'RLE8 padding' => [8, 1, "\x00\x03\x01\x02\x03"],
+    'RLE4 literals' => [4, 2, "\x00\x05\x12\x34"],
+    'RLE4 padding' => [4, 2, "\x00\x05\x12\x34\x50"],
+    'missing end marker' => [8, 1, "\x05\x01"],
+] as $name => [$bits, $compression, $payload]) {
+    file_put_contents($truncatedRle, buildBmp($bw, 1, $bits, $payload, [
+        'compression' => $compression, 'palette' => $paletteBytes,
+    ]));
+    file_put_contents($cliOut, 'existing output');
+    [$status, $text] = $stderrRun($truncatedRle, $cliOut, '--no-gd');
+    check(
+        "truncated $name is rejected without replacing output",
+        $status === 1 && str_contains($text, 'truncated BMP RLE data')
+            && !str_contains($text, 'Fatal error') && file_get_contents($cliOut) === 'existing output'
+    );
+}
+@unlink($cliOut);
+
+$embeddedJpeg = $tmp . '/embedded-jpeg.bmp';
+file_put_contents($embeddedJpeg, buildBmp($bw, $bh, 24, $bottomUp, ['compression' => 4]));
+[$status, $text] = $stderrRun($embeddedJpeg, $cliOut, '--no-gd');
+check('a BMP holding an embedded JPEG is refused by name', $status === 1 && str_contains($text, 'embedded JPEG'), trim($text));
+
+$bmText = $tmp . '/starts-with-bm.bmp';
+file_put_contents($bmText, 'BM' . str_repeat('not a bitmap at all ', 8));
+[$status, $text] = $stderrRun($bmText, $cliOut, '--no-gd');
+check('a file that merely starts with BM is refused cleanly', $status === 1 && !str_contains($text, 'Fatal error'), trim($text));
+
+$hugeBmp = $tmp . '/oversized.bmp';
+file_put_contents($hugeBmp, buildBmp(20000, 1, 24, str_repeat("\x00", 8)));
+$oversized = null;
+try {
+    ImageMeta::read($hugeBmp);
+} catch (\RuntimeException $e) {
+    $oversized = $e->getMessage();
+}
+check('an oversized BMP is refused before any pixels are read', $oversized !== null && str_contains($oversized, 'dimensions out of range'), (string) $oversized);
+
+// Independent decoders on the same files: libgd where it reads BMP at all, and
+// ImageMagick for the layouts libgd will not touch.
+if ($haveGd) {
+    $gdImage = @imagecreatefrombmp($bmp24);
+    if ($gdImage === false) {
+        skip('BMP compared with libgd', 'this libgd build will not read the file');
+    } else {
+        $gdRgb = '';
+        for ($y = 0; $y < imagesy($gdImage); $y++) {
+            for ($x = 0; $x < imagesx($gdImage); $x++) {
+                $c = imagecolorat($gdImage, $x, $y);
+                $gdRgb .= chr(($c >> 16) & 0xFF) . chr(($c >> 8) & 0xFF) . chr($c & 0xFF);
+            }
+        }
+        imagedestroy($gdImage);
+        check('bundled BMP pixels match libgd', $gdRgb === BmpReader::read($bmp24)['rgb']);
+    }
+} else {
+    skip('BMP compared with libgd', 'ext-gd not loaded');
+}
+
+if (trim((string) shell_exec('command -v magick 2>/dev/null')) !== '') {
+    $ppm = $tmp . '/bmp-src.ppm';
+    file_put_contents($ppm, "P6\n$w $h\n255\n" . $rgb);
+    $pam = $tmp . '/bmp-src.pam';
+    $rgbaRows = '';
+    for ($i = 0; $i < $w * $h; $i++) {
+        $rgbaRows .= substr($rgb, $i * 3, 3) . $alpha[$i];
+    }
+    file_put_contents($pam, "P7\nWIDTH $w\nHEIGHT $h\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" . $rgbaRows);
+
+    $cases = [
+        ['24-bit', '-type TrueColor', $ppm, false, 0],
+        ['24-bit 40-byte header', '-define bmp:format=bmp3', $ppm, false, 0],
+        ['8-bit palette', '-colors 256 -type Palette -compress None', $ppm, false, 0],
+        ['4-bit palette', '-colors 16 -type Palette -compress None', $ppm, false, 0],
+        ['1-bit palette', '-colors 2 -type Palette -compress None', $ppm, false, 0],
+        ['8-bit RLE', '-colors 256 -type Palette -compress RLE', $ppm, false, 0],
+        ['16-bit 5-5-5', '-define bmp:subtype=RGB555', $ppm, false, 1],
+        ['16-bit 5-6-5', '-define bmp:subtype=RGB565', $ppm, false, 1],
+        ['32-bit alpha', '-define bmp:format=bmp4', $pam, true, 0],
+    ];
+    foreach ($cases as [$name, $flags, $source, $withAlpha, $slack]) {
+        $file = $tmp . '/magick-' . str_replace(' ', '-', $name) . '.bmp';
+        exec('magick ' . escapeshellarg($source) . ' ' . $flags . ' ' . escapeshellarg($file) . ' 2>&1', $lines, $status);
+        if ($status !== 0 || !is_file($file)) {
+            skip("ImageMagick $name BMP", 'magick could not write it');
+            continue;
+        }
+        try {
+            $decoded = BmpReader::read($file);
+        } catch (\RuntimeException | \InvalidArgumentException $e) {
+            check("ImageMagick $name BMP decodes", false, $e->getMessage());
+            continue;
+        }
+        $reference = $tmp . '/magick-ref.raw';
+        @unlink($reference);
+        exec('magick ' . escapeshellarg($file) . ' -depth 8 rgb:' . escapeshellarg($reference) . ' 2>&1', $lines, $status);
+        $refBytes = (string) @file_get_contents($reference);
+        $worst = $status !== 0 || $refBytes === '' || strlen($refBytes) !== strlen($decoded['rgb']) ? 999 : 0;
+        for ($i = 0, $n = min(strlen($refBytes), strlen($decoded['rgb'])); $i < $n; $i++) {
+            $worst = max($worst, abs(ord($refBytes[$i]) - ord($decoded['rgb'][$i])));
+        }
+        check(
+            "ImageMagick $name BMP matches ImageMagick's own decode",
+            $worst <= $slack,
+            $worst === 0 ? 'identical' : "max delta $worst"
+        );
+        if ($withAlpha) {
+            $refAlphaFile = $tmp . '/magick-ref-alpha.raw';
+            @unlink($refAlphaFile);
+            exec('magick ' . escapeshellarg($file) . ' -depth 8 rgba:' . escapeshellarg($refAlphaFile) . ' 2>&1', $lines, $status);
+            $refAlphaBytes = (string) @file_get_contents($refAlphaFile);
+            $refAlpha = '';
+            for ($i = 3; $i < strlen($refAlphaBytes); $i += 4) {
+                $refAlpha .= $refAlphaBytes[$i];
+            }
+            check('ImageMagick 32-bit alpha BMP carries the alpha plane', $refAlpha !== '' && $refAlpha === $decoded['alpha']);
+        }
+    }
+} else {
+    skip('BMP files written by ImageMagick', 'magick not on PATH');
+}
 
 rmTree($tmp);
 

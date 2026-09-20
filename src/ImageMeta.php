@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PicoWebP\Vp8;
 
+require_once __DIR__ . '/BmpReader.php';
+
 /**
  * Header-level facts about a source image, read without decoding it.
  *
@@ -24,6 +26,9 @@ namespace PicoWebP\Vp8;
  * any work: is this file already a WebP?  That is decided by the bytes, not by
  * the extension, and the size comes out of the container header so a skipped
  * input can still be reported without decoding it.
+ *
+ * BMP is read through BmpReader's header walk so channel masks and embedded
+ * profiles are available alongside the dimensions reported by getimagesize().
  */
 final class ImageMeta
 {
@@ -47,9 +52,9 @@ final class ImageMeta
     public int $type;
     public int $width;
     public int $height;
-    /** PNG colour type, or -1 for JPEG. */
+    /** PNG colour type, or -1 for other formats. */
     public int $colorType;
-    /** PNG bit depth per channel, or -1 for JPEG. */
+    /** PNG bits per channel or BMP bits per pixel; -1 for other formats. */
     public int $bitDepth;
     /** Raw tRNS payload, or null when the PNG has none. */
     public ?string $trns;
@@ -57,6 +62,10 @@ final class ImageMeta
     public ?string $icc;
     /** For a WebP source, the RIFF chunk carrying the image: VP8X, VP8 or VP8L. */
     public ?string $webpChunk;
+    /** BMP compression method (0 BI_RGB, 1 RLE8, 2 RLE4, 3 bitfields, 6 alpha bitfields), or -1. */
+    public int $bmpCompression;
+    /** BMP: the header declares a real alpha channel. */
+    public bool $bmpAlpha;
 
     /** @var array<int,int>|null resolved tRNS key colour */
     private ?array $trnsKey = null;
@@ -70,7 +79,9 @@ final class ImageMeta
         int $bitDepth = -1,
         ?string $trns = null,
         ?string $icc = null,
-        ?string $webpChunk = null
+        ?string $webpChunk = null,
+        int $bmpCompression = -1,
+        bool $bmpAlpha = false
     ) {
         $this->type = $type;
         $this->width = $width;
@@ -80,10 +91,12 @@ final class ImageMeta
         $this->trns = $trns;
         $this->icc = $icc;
         $this->webpChunk = $webpChunk;
+        $this->bmpCompression = $bmpCompression;
+        $this->bmpAlpha = $bmpAlpha;
     }
 
     /**
-     * Read the metadata for a PNG, JPEG or WebP file.
+     * Read the metadata for a PNG, JPEG, BMP or WebP file.
      *
      * Only chunk/marker headers are read; pixel data is skipped over, so this
      * is cheap next to a decode even on a 12 MP source.
@@ -98,7 +111,33 @@ final class ImageMeta
             return self::readWebp($path);
         }
 
-        $info = @getimagesize($path);
+        // BMP before getimagesize() as well: the DIB header's channel masks
+        // decide whether alpha is possible, and getimagesize() omits them.
+        $head = self::head($path);
+        $info = null;
+        if (str_starts_with($head, 'BM')) {
+            try {
+                return self::readBmp($path);
+            } catch (\InvalidArgumentException $bmpFailure) {
+                // Starts with "BM": either a bitmap this reader will not take
+                // — a truncated one, an embedded JPEG — or some other file
+                // that merely begins that way.  getimagesize() tells the two
+                // apart, and a bitmap keeps the reader's own reason.
+                $info = @getimagesize($path);
+                if ($info !== false && $info[2] === IMAGETYPE_BMP) {
+                    // It really is a bitmap, so the reader's reason is the
+                    // useful one — reported as the same RuntimeException shape
+                    // every other unreadable file gets from this method.
+                    throw new \RuntimeException(
+                        'cannot read image: ' . $path . ' (' . $bmpFailure->getMessage() . ')',
+                        0,
+                        $bmpFailure
+                    );
+                }
+            }
+        }
+
+        $info ??= @getimagesize($path);
         if ($info === false) {
             throw new \RuntimeException("cannot read image: $path");
         }
@@ -111,7 +150,7 @@ final class ImageMeta
         }
 
         throw new \RuntimeException(
-            'unsupported image type for ' . basename($path) . ': PNG and JPEG are the inputs (WebP is skipped)'
+            'unsupported image type for ' . basename($path) . ': PNG, JPEG and BMP are the inputs (WebP is skipped)'
         );
     }
 
@@ -134,6 +173,10 @@ final class ImageMeta
             // Extended-format WebP carries an alpha channel; whether it uses
             // one is a per-pixel question the loader answers.
             return true;
+        }
+        if ($this->type === IMAGETYPE_BMP) {
+            // Only a header that declares an alpha mask can be translucent.
+            return $this->bmpAlpha;
         }
         if ($this->type !== IMAGETYPE_PNG) {
             return false;
@@ -175,7 +218,20 @@ final class ImageMeta
             return 'webp (' . rtrim((string) $this->webpChunk) . ')';
         }
         $parts = [];
-        if ($this->type === IMAGETYPE_PNG) {
+        if ($this->type === IMAGETYPE_BMP) {
+            $parts[] = 'bmp';
+            $parts[] = $this->bitDepth . 'bpp';
+            $parts[] = match ($this->bmpCompression) {
+                1 => 'rle8',
+                2 => 'rle4',
+                3 => 'bitfields',
+                6 => 'alpha-bitfields',
+                default => 'rgb',
+            };
+            if ($this->bmpAlpha) {
+                $parts[] = 'alpha';
+            }
+        } elseif ($this->type === IMAGETYPE_PNG) {
             $parts[] = 'png/ct' . $this->colorType . '/bd' . $this->bitDepth;
             if ($this->trns !== null) {
                 $parts[] = $this->trnsKey() === null ? 'trns(palette)' : 'trns(key)';
@@ -188,6 +244,28 @@ final class ImageMeta
         }
 
         return implode(' ', $parts);
+    }
+
+    /**
+     * A BMP, described by its DIB header: size, bit depth, storage layout and
+     * whether it declares an alpha channel.  No pixels are touched.
+     */
+    private static function readBmp(string $path): self
+    {
+        $hdr = BmpReader::probe($path);
+
+        return new self(
+            IMAGETYPE_BMP,
+            $hdr['w'],
+            $hdr['h'],
+            -1,
+            $hdr['bits'],
+            null,
+            $hdr['icc'],
+            null,
+            $hdr['compression'],
+            $hdr['alpha']
+        );
     }
 
     /**

@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-21
+
+### Added
+
+- `BmpReader` — reads BMP files without GD. Supports the OS/2 core header,
+  `BITMAPINFOHEADER` and V2–V5 headers at 1, 4, 8, 16, 24 and 32 bits per
+  pixel, including palettes, bottom-up and top-down rows, `BI_RLE8` and
+  `BI_RLE4`, channel masks and embedded V5 ICC profiles.
+- BMP transparency through a declared alpha mask, including fully transparent
+  images. The unused fourth byte of a 32-bit `BI_RGB` file is ignored.
+- BMP metadata in `ImageMeta`: dimensions, bit depth, storage method and alpha
+  capability. `ImageInput` uses the bundled BMP reader on every host, including
+  those with GD installed.
+- BMP input in the CLI and file-encoding example. Truncated pixel data and
+  incomplete RLE streams are rejected before an output file is replaced.
+- BMP fixtures in the test suite, with comparisons against GD and, when
+  `magick` is available, ImageMagick. Includes checks for transparent and opaque
+  alpha channels, unused masks, profile offsets and malformed RLE data.
+
+### Changed
+
+- Refresh the README with Packagist installation, BMP examples, supported
+  layouts, and reader timing and memory measurements.
+
+### Notes
+
+- The reader scales 5- and 6-bit colour channels to eight bits using rounding.
+  Another decoder may differ by one step for some colours.
+
 ## [1.0.1] - 2026-09-20
 
 ### Fixed
@@ -119,5 +148,6 @@ WebP support at all.
   to 21% larger files on flat logos and UI artwork. The measured tables, and
   what would move them, are in the README.
 
+[1.1.0]: https://github.com/lame13/picowebp/compare/1.0.1...1.1.0
 [1.0.1]: https://github.com/lame13/picowebp/compare/1.0.0...1.0.1
 [1.0.0]: https://github.com/lame13/picowebp/releases/tag/1.0.0

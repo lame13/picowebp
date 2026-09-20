@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * Two ways to get a WebP out of picowebp:
  *
- *   php examples/encode.php photo.jpg photo.webp
+ *   php examples/encode.php photo.jpg photo.webp      (PNG, JPEG or BMP)
  *   php examples/encode.php --raw pixels.raw out.webp 1200 800
  *
  * A WebP source is skipped (exit 4): it is already the format this writes.
@@ -16,7 +16,7 @@ $vendored = $root . '/vendor/autoload.php';
 if (is_file($vendored)) {
     require_once $vendored;
 } else {
-    foreach (['Vp8Tables', 'AlphaCoder', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput'] as $file) {
+    foreach (['Vp8Tables', 'AlphaCoder', 'BmpReader', 'ImageMeta', 'SkippedInput', 'PngReader', 'JpegReader', 'Vp8LossyEncoder', 'ImageInput'] as $file) {
         require_once $root . '/src/' . $file . '.php';
     }
 }

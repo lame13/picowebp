@@ -8,6 +8,7 @@ require_once __DIR__ . '/ImageMeta.php';
 require_once __DIR__ . '/SkippedInput.php';
 require_once __DIR__ . '/PngReader.php';
 require_once __DIR__ . '/JpegReader.php';
+require_once __DIR__ . '/BmpReader.php';
 
 /**
  * Source-image loading for the pure-PHP encoder: one GD decode, one pass over
@@ -29,13 +30,16 @@ require_once __DIR__ . '/JpegReader.php';
  *
  * It is also where the "nothing to do here" decision lives: a source that is
  * already a WebP throws SkippedInput instead of being decoded and re-coded.
+ *
+ * BMP always uses the bundled reader so channel masks, RLE and alpha behave
+ * the same on hosts with and without GD.
  */
 final class ImageInput
 {
     /**
      * Use the bundled readers even where GD is available.
      *
-     * GD is the default when it is present: it is faster, and it keeps output
+     * For PNG and JPEG, GD is the default when present: it is faster and keeps output
      * byte-identical to what this encoder produced before the bundled readers
      * existed.  The bundled PNG reader is nevertheless worth having on
      * purpose — it expands palette entries and tRNS keys the way the
@@ -84,6 +88,18 @@ final class ImageInput
         $haveGd = self::haveGd();
         $bundled = self::$preferBundled || !$haveGd;
 
+        if ($meta->type === IMAGETYPE_BMP) {
+            $bmp = BmpReader::read($path);
+
+            return [
+                'w' => $bmp['w'],
+                'h' => $bmp['h'],
+                'rgb' => $bmp['rgb'],
+                'alpha' => $bmp['alpha'],
+                'icc' => $bmp['icc'] ?? $meta->icc,
+                'reader' => 'bundled',
+            ];
+        }
         if ($bundled && $meta->type === IMAGETYPE_PNG) {
             $png = PngReader::read($path);
 
@@ -212,9 +228,13 @@ final class ImageInput
     }
 
     /**
-     * Decode a PNG or JPEG into a true-colour GdImage ready to be read with
-     * imagecolorat().  Shared with PlaneStore so that both loaders agree bit
-     * for bit about what the source pixels are.
+     * Decode a PNG, JPEG or WebP into a true-colour GdImage ready to be read
+     * with imagecolorat().  Shared with PlaneStore so that both loaders agree
+     * bit for bit about what the source pixels are.
+     *
+     * BMP is accepted here for callers that ask for it by type, but the pixel
+     * path never routes a BMP through GD: libgd reads a subset of the format
+     * and reports nothing about the rest.
      *
      * @return \GdImage
      */
@@ -223,6 +243,7 @@ final class ImageInput
         $im = match ($type) {
             IMAGETYPE_PNG => @imagecreatefrompng($path),
             IMAGETYPE_JPEG => @imagecreatefromjpeg($path),
+            IMAGETYPE_BMP => function_exists('imagecreatefrombmp') ? @imagecreatefrombmp($path) : false,
             // GD is the only WebP decoder in the package, and not every GD
             // build has it: a function that is not there must throw the same
             // way a decode failure does, not fatal with "undefined function".
@@ -234,6 +255,7 @@ final class ImageInput
                 'cannot decode ' . basename($path) . ' as ' . match ($type) {
                     IMAGETYPE_PNG => 'PNG',
                     IMAGETYPE_JPEG => 'JPEG',
+                    IMAGETYPE_BMP => 'BMP (this GD build has no BMP decoder)',
                     IMAGETYPE_WEBP => 'WebP (this GD build has no WebP decoder)',
                     default => 'an unsupported image type',
                 }

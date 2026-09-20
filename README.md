@@ -1,6 +1,6 @@
 # PicoWebP
 
-PicoWebP converts PNGs, baseline JPEGs and raw RGB pixels to WebP using PHP. The encoder writes the VP8 bitstream itself, and the PNG and JPEG readers ship with the package. No GD, Imagick, `cwebp` or libwebp is required for those inputs.
+PicoWebP converts PNGs, baseline JPEGs, BMPs and raw RGB pixels to WebP using PHP. The encoder writes the VP8 bitstream itself, and the PNG, JPEG and BMP readers ship with the package. No GD, Imagick, `cwebp` or libwebp is required for those inputs.
 
 This is for the host where you need WebP conversion but cannot install an image extension or a command-line encoder. It keeps transparency and ICC colour profiles, works from PHP or the command line, and includes a way to split encoding into smaller jobs.
 
@@ -85,6 +85,7 @@ Composer installs the command in `vendor/bin`:
 ```sh
 vendor/bin/picowebp photo.jpg photo.webp --quality=80
 vendor/bin/picowebp image.png image.webp --quality=80 --no-gd
+vendor/bin/picowebp screenshot.bmp screenshot.webp --quality=80
 vendor/bin/picowebp pixels.raw out.webp --quality=80 --rgb=1200x800
 vendor/bin/picowebp --help
 ```
@@ -115,17 +116,24 @@ The CLI exits with `0` after an encode, `1` for an error, `3` when `--alpha=fail
 | Baseline JPEG | Sequential, 8-bit greyscale or YCbCr; all sampling factors, restart markers and `APP2` ICC profiles |
 | Progressive JPEG | Requires GD |
 | PNG | Every colour type and bit depth, including interlacing, palettes, `tRNS` transparency and `iCCP` profiles |
+| BMP | 1, 4, 8, 16, 24 and 32 bits per pixel; uncompressed pixels, `RLE4` and `RLE8`; channel masks and embedded V5 ICC profiles |
 | Raw RGB | Packed 8-bit RGB, with an optional alpha plane |
 | WebP | Skipped by default; re-encoding requires GD |
-| BMP, GIF, TIFF / TIF, raw Y′CbCr | Not supported |
+| GIF, TIFF / TIF, raw Y′CbCr | Not supported |
 
 On a host without GD, progressive JPEGs need to be converted to baseline JPEG or decoded to raw RGB elsewhere first. The bundled reader reports unsupported JPEG variants rather than attempting to decode them as baseline.
+
+BMP files always use the bundled reader, so decoding behaves the same on hosts with and without GD. It reads OS/2 core headers and Windows `BITMAPINFOHEADER` and V2–V5 headers, including palettes, channel masks and bottom-up or top-down rows. Other header formats and BMPs containing JPEG or PNG payloads are not supported.
+
+For 16-bit BMPs, PicoWebP scales the 5- or 6-bit colour channels to eight bits using rounding. Another decoder may produce a value one step higher or lower for some colours.
 
 ### Transparency and metadata
 
 The bundled PNG reader retains all eight bits of alpha, including palette transparency and `tRNS`. The encoder stores that alpha losslessly in an `ALPH` chunk alongside the lossy colour data. Fully opaque images do not need an alpha chunk. GD has lower alpha precision, so use the bundled reader when preserving the source alpha exactly matters.
 
-ICC profiles from PNG `iCCP` and JPEG `APP2` chunks are copied into the output. This preserves the profile; it does not make the colour encoding lossless.
+BMP transparency comes from an alpha mask in the header or the mask block that follows it. A declared alpha channel is preserved, including an image where every pixel is fully transparent. A 32-bit `BI_RGB` file uses the opaque `BGRX` layout, so its fourth byte and any unused channel masks are ignored.
+
+ICC profiles from PNG `iCCP` and JPEG `APP2` chunks, and embedded profiles from BMP V5 headers, are copied into the output. This preserves the profile; it does not make the colour encoding lossless.
 
 EXIF metadata is not copied, and orientation tags are not applied. Rotate or mirror photos as needed before passing them to PicoWebP.
 
@@ -214,17 +222,26 @@ The measurements below were recorded on one macOS laptop using PHP 8.4, quality 
 | 3 MP synthetic JPEG | 78.8 s | 26.3 | 24 MB |
 | 12 MP synthetic JPEG | 377.5 s | 31.5 | 84 MB |
 
-**Reading only**, before encoding starts:
+**Reading only**, before encoding starts. The table records results for a 4000×3000 photo re-saved in each format, with a range for PNG filter layouts. The phone screenshot discussed below is a separate sample:
 
-| Reader | Approximate time per MP | Time for 12 MP |
-|---|---:|---:|
-| Bundled JPEG reader | 1.5 s | 18.0 s |
-| Bundled PNG reader | 0.4 s | 5 s |
-| GD | 0.12 s | 1.4 s |
+| Reader | Time per MP | Time for 12 MP | Peak memory |
+|---|---:|---:|---:|
+| Bundled JPEG reader | 1.7 s | 20.9 s | 111 MB |
+| Bundled PNG reader | 0.01–0.8 s | 0.1–9.5 s | 86 MB |
+| Bundled BMP reader, 24-bit | 0.06 s | 0.7 s | 73 MB |
+| Bundled BMP reader, 16-bit masked | 0.45 s | 5.4 s | 61 MB |
+| Bundled BMP reader, 8-bit `RLE` | 0.17 s | 2.0 s | 54 MB |
+| GD, reading the same JPEG | 0.12 s | 1.4 s | 84 MB |
+
+The encoder receives decoded pixels, so inputs with the same RGB, alpha and ICC data produce the same output at the same settings. The same 800×600 photo saved as BMP, PNG and raw RGB produced byte-identical WebP output — 42,814 bytes from all three — where libwebp wrote 42,952.
+
+The three BMP rows use the same source image in different storage layouts. Reducing it to 16-bit colour or an 8-bit palette can change the decoded pixels. The 24-bit reader mainly reorders BGR bytes into RGB. The 16-bit path took about seven times as long per pixel in this sample, since each channel has to be unpacked and scaled to a byte; `RLE` took about two and a half times as long. An uncompressed 24-bit BMP also needs roughly three bytes per pixel: a 12 MP file is about 34 MiB, and the reader holds that alongside the decoded RGB while it works.
+
+PNG read time depends heavily on the filters chosen by the writer, as well as the compressed data. In a separate screenshot sample, rows using `None` read at 19 ms/MP (about 0.02 s/MP); the photo PNG using Paeth read at 0.8 s/MP, about forty times slower. The screenshot result is not the lower bound in the table. Time a file from your own source before planning a queue around PNG input.
 
 In the bundled JPEG reader, the recorded CPU breakdown was 53% inverse DCT, 27% upsampling and YCbCr-to-RGB conversion, 6% block storage and 13% Huffman decoding. For comparison, libjpeg-turbo decoded the 12 MP image in 0.11 s; the GD path also spends time copying pixels into the RGB buffer.
 
-For the measured 12 MP JPEG, reading and encoding together took about 395 seconds with the bundled reader. GD speeds up the reading stage, but the PHP encoding work remains. Native libwebp is substantially faster.
+Adding the listed 12 MP JPEG read and encode times gives about 398 seconds with the bundled reader. This is a sum of the separate measurements. GD speeds up the reading stage, but the PHP encoding work remains. Native libwebp is substantially faster.
 
 Keep conversions out of page requests. Limit input dimensions, allow for the decoded image's memory use, and pace queue jobs to fit your host's CPU allowance.
 
