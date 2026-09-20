@@ -1,98 +1,44 @@
 # picowebp
 
-A pure-PHP WebP encoder.
+picowebp makes WebP files in PHP. Give it a PNG, a baseline JPEG or raw RGB
+pixels, and it writes a lossy WebP with transparency and ICC colour profiles
+intact.
 
-picowebp turns a packed RGB buffer into a **VP8 lossy WebP key frame** using
-nothing but PHP. No GD, no Imagick, no `cwebp`, no libwebp, no shelling out.
-The bytes it produces are ordinary WebP files: libwebp's `dwebp`, `webpinfo`,
-every browser and every image pipeline read them normally.
+It's meant for hosts where GD, Imagick and `cwebp` aren't available. The PNG
+and JPEG readers are included, and the encoder writes the VP8 bitstream
+itself. You can use it from PHP or the command line, and there's a resumable
+path for jobs that need to run in small chunks.
 
-It exists for the case where a host has no WebP support at all: no GD with
-WebP, no Imagick, no `cwebp` binary, no WASM. It is a fallback, not a
-general-purpose encoder — read [Cost](#cost) before reaching for it.
+The catch is speed. With the default settings, a 1 MP image takes about
+25 seconds on the machine used for the benchmarks below. A 12 MP photo takes
+several minutes. Plan to run this in a background queue; the [benchmarks](#cost)
+give you a better idea of what to expect.
+
+[Install](#install) · [Quick start](#quick-start) · [Command line](#command-line) ·
+[Input formats](#input-formats) · [Sizes](#sizes) · [Limitations](#limitations)
 
 ## Requirements
 
-| | |
-|---|---|
-| PHP | 8.1 or newer |
-| `ext-zlib` | required — PNG's DEFLATE container and the alpha channel both need it |
-| `ext-gd` | optional — faster, handles progressive JPEG, and is the only way to re-encode a WebP source; never required |
+You'll need PHP 8.1 or newer and the zlib extension (`ext-zlib`).
 
-Nothing else is needed. `PngReader` and `JpegReader` are pure PHP, so a host
-with no image extension at all can still go from a file on disk to WebP. GD is
-used when it happens to be there, because it is quicker — but the bundled
-readers are not merely a fallback: the PNG one keeps all eight bits of alpha
-where libgd rounds to seven, and expands palette entries and `tRNS` keys by
-the specification rather than libgd's approximation.
-
-The encoder proper (`Vp8LossyEncoder`) takes a packed RGB string and needs
-nothing but zlib. If you already have pixels, skip the readers entirely —
-`encode()` is the whole interface.
-
-## Input formats
-
-| input | status |
-|---|---|
-| JPEG (`.jpg`, `.jpeg`) | ✅ supported — baseline sequential, 8-bit, greyscale or YCbCr, all sampling factors, restart markers, `APP2` ICC |
-| JPEG, progressive | ❌ not implemented without GD — the bundled reader refuses it by name; where GD is installed it takes those files instead |
-| PNG | ✅ supported — every colour type and bit depth, interlaced or not, palettes, `tRNS`, `iCCP` |
-| Raw RGB | ✅ supported — `--rgb=WxH`, with an optional raw 8-bit alpha plane |
-| WebP | ⏭️ skipped — already the format this writes; detected by content, never re-encoded by accident |
-| BMP | ❌ not implemented |
-| Raw Y′CbCr | ❌ not implemented |
-| GIF | ❌ not implemented |
-| TIFF / TIF | ❌ not implemented |
-
-**Legend:** ✅ supported · ⏭️ skipped, nothing to do · ❌ not implemented yet.
-
-**The remaining format limitation is progressive JPEG without GD.**  Progressive
-is roughly ten scans of "here is a bit more of every coefficient", which the
-baseline reader has no path for, so it refuses a progressive file by name —
-saying which variant it found — rather than guessing. Where GD is installed it
-takes those images instead, which covers essentially every host that runs
-WordPress. Where it is not, re-save the image as baseline or feed `--rgb`. See
-[Limitations](#limitations) for what adding it would cost.
-
-The four ❌ rows *below* progressive are the direction of travel rather than a
-roadmap: BMP and GIF are cheap enough that they are mostly palette plumbing,
-TIFF is not, and raw Y′CbCr is there for callers who already hold subsampled
-planes and would rather hand them over than re-derive them. None of them is
-implemented.
-
-### A WebP in, nothing out
-
-An input that is already a WebP is skipped rather than converted — the job a
-converter is handed has been done already, and re-encoding would burn CPU to
-lose quality from pixels that are already quantised. The decision is made on
-the file's **bytes**, not its extension, so `photo.jpg` that is really a WebP
-is still skipped and `photo.webp` that is really a PNG is still converted.
-
-```php
-use PicoWebP\Vp8\ImageInput;
-use PicoWebP\Vp8\SkippedInput;
-
-try {
-    $pixels = ImageInput::pixels($file);
-} catch (SkippedInput $e) {
-    // $e->reason() -> 'webp (already the target format)'
-    // $e->slug()   -> 'skipped_webp'
-    // $e->meta     -> size and container, read from the header
-    continue;   // nothing to do, and nothing wrong
-}
-```
-
-`SkippedInput` extends `RuntimeException`, so a caller that has never heard of
-it keeps working. `ImageInput::isWebp($file)` asks the same question without an
-exception, and `ImageInput::$skipWebp = false` (or `--reencode-webp` on the
-command line) overrides the whole thing for the caller who really does want a
-WebP coded a second time. That is the one input which needs GD, since nothing
-here decodes WebP in pure PHP.
-
-On the command line a skip is **exit code 4** with no output file written, so a
-queue can tell "converted" from "there was nothing to convert".
+If GD is installed, picowebp uses it to read images faster. It's also needed
+for progressive JPEGs and for re-encoding an existing WebP. Everything else
+works without it, and WebP encoding always runs in PHP.
 
 ## Install
+
+For now, install from GitHub. Run these in your application's directory:
+
+```sh
+composer config repositories.picowebp vcs https://github.com/lame13/picowebp.git
+composer require nikocodes/picowebp:^1.0
+```
+
+While the repository is private, you'll need to give Composer access to your
+GitHub account. [Composer's documentation](https://getcomposer.org/doc/05-repositories.md#using-private-repositories)
+covers private repositories.
+
+Once it's published on Packagist, this is all a new project will need:
 
 ```sh
 composer require nikocodes/picowebp
@@ -100,77 +46,165 @@ composer require nikocodes/picowebp
 
 ## Quick start
 
+Put `photo.jpg` and this script in your application's root directory, then
+run the script with PHP:
+
 ```php
+<?php
+
+require __DIR__ . '/vendor/autoload.php';
+
 use PicoWebP\Vp8\ImageInput;
 use PicoWebP\Vp8\Vp8LossyEncoder;
 
-// With GD or without it: the bundled readers are pure PHP.
 $pixels = ImageInput::pixels('photo.jpg');
 
-$enc = Vp8LossyEncoder::fromQuality(80);
-$enc->alphaPlane = $pixels['alpha'];   // null unless the source is translucent
-$enc->iccProfile = $pixels['icc'];     // null unless the source is tagged
+$encoder = Vp8LossyEncoder::fromQuality(80);
+$encoder->alphaPlane = $pixels['alpha']; // null for an opaque source
+$encoder->iccProfile = $pixels['icc'];   // null for an untagged source
 
-file_put_contents('photo.webp', $enc->encode($pixels['rgb'], $pixels['w'], $pixels['h'])['webp']);
+$result = $encoder->encode($pixels['rgb'], $pixels['w'], $pixels['h']);
+if (file_put_contents('photo.webp', $result['webp']) !== strlen($result['webp'])) {
+    throw new RuntimeException('Could not write photo.webp');
+}
 ```
 
-Or straight from raw pixels, with no image extension in the picture at all:
+Quality runs from `0` to `100`. Swap `photo.jpg` for a PNG and the same code
+will keep its transparency. If the input is already a WebP, you'll get a
+[`SkippedInput`](#handling-existing-webp-files) exception.
+
+If you already have the pixels, pass them to the encoder as an RGB string:
+three bytes per pixel, red then green then blue, from top left to bottom
+right. Here's a small red square:
 
 ```php
-$enc = Vp8LossyEncoder::fromQuality(80);
-$webp = $enc->encode($pixels, $width, $height)['webp'];
+<?php
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PicoWebP\Vp8\Vp8LossyEncoder;
+
+$width = 16;
+$height = 16;
+$rgb = str_repeat("\xff\x00\x00", $width * $height); // solid red
+
+$encoder = Vp8LossyEncoder::fromQuality(80);
+$webp = $encoder->encode($rgb, $width, $height)['webp'];
+if (file_put_contents('red.webp', $webp) !== strlen($webp)) {
+    throw new RuntimeException('Could not write red.webp');
+}
 ```
 
-There is a runnable version of both in [`examples/`](examples).
+There's a runnable version for both kinds of input in
+[`examples/encode.php`](examples/encode.php). For a job you can pause and
+resume, see [`examples/chunked-queue.php`](examples/chunked-queue.php).
 
-`ImageInput::$preferBundled = true` forces the bundled readers even where GD
-is installed — worth it for the exact alpha and the palette handling.
-`ImageInput::$gdAvailable = false` guarantees no GD code runs at all.
+You can choose the bundled readers even when GD is installed:
+set `ImageInput::$preferBundled = true`. To turn off GD completely, use
+`ImageInput::$gdAvailable = false`.
 
 ## Command line
 
+Composer installs the command in `vendor/bin`:
+
 ```sh
-bin/picowebp photo.jpg photo.webp --quality=80
-bin/picowebp pixels.raw out.webp --quality=80 --rgb=1200x800
+vendor/bin/picowebp photo.jpg photo.webp --quality=80
+vendor/bin/picowebp image.png image.webp --quality=80 --no-gd
+vendor/bin/picowebp pixels.raw out.webp --quality=80 --rgb=1200x800
+vendor/bin/picowebp --help
 ```
 
-`--rgb=WxH` reads the input as headerless 8-bit RGB (3 bytes per pixel, row
-major, top-left first) and bypasses GD entirely. `--alpha-plane=FILE` attaches
-a raw 8-bit alpha plane to such an input.
+If you've cloned this repository, the command is `bin/picowebp`.
 
-Run `bin/picowebp` with no arguments for the full flag list, including
-`--alpha=keep|flatten|fail`, `--icc=FILE`, `--no-icc`, `--no-rd`,
-`--no-adapt-probs`, `--bundled` (use the bundled readers even where GD
-exists), `--no-gd` (never touch GD), `--reencode-webp` (code a WebP source
-instead of skipping it) and the CPU/quality knobs.
+For raw input, `--rgb=WxH` tells the reader how wide and tall the image is.
+You can add transparency with `--alpha-plane=FILE`, using one byte per pixel.
+A few other useful options:
+
+| Option | Behaviour |
+|---|---|
+| `--alpha=keep\|flatten\|fail` | Preserve transparency (default), drop it, or refuse transparent input |
+| `--icc=FILE` / `--no-icc` | Supply a colour profile or omit it |
+| `--bundled` / `--no-gd` | Prefer the bundled readers or disable GD |
+| `--reencode-webp` | Convert an existing WebP instead of skipping it; requires GD |
+| `--json` | Print a machine-readable report |
+
+Run `--help` for the rest, including the settings that trade quality for speed.
+
+Exit codes are `0` for a successful encode, `1` for an error, `3` when
+`--alpha=fail` rejects transparency, and `4` when an existing WebP is skipped.
+
+## Input formats
+
+| Input | Support |
+|---|---|
+| JPEG (`.jpg`, `.jpeg`) | Baseline sequential, 8-bit, greyscale or YCbCr; all sampling factors, restart markers and `APP2` ICC |
+| Progressive JPEG | Needs GD |
+| PNG | Every colour type and bit depth, including interlaced images, palettes, `tRNS` and `iCCP` |
+| Raw RGB | Use `--rgb=WxH`; an optional alpha plane adds transparency |
+| WebP | Skipped by default; `--reencode-webp` needs GD |
+| BMP, GIF, TIFF / TIF | Not supported |
+| Raw Y′CbCr | Not supported |
+
+If you hit a progressive JPEG on a host without GD, re-save it as baseline
+JPEG or pass in raw RGB pixels. The bundled reader will tell you when that's
+the problem.
+
+### Handling existing WebP files
+
+An existing WebP usually doesn't need converting again. Re-encoding takes
+time and can lose more detail, so picowebp skips it by default.
+
+The reader checks the file's contents. A WebP named `photo.jpg` still gets
+skipped; a PNG named `photo.webp` still gets converted. In a queue, you can
+catch the skip and move on to the next file:
+
+```php
+<?php
+
+require __DIR__ . '/vendor/autoload.php';
+
+use PicoWebP\Vp8\ImageInput;
+use PicoWebP\Vp8\SkippedInput;
+
+foreach (['photo.jpg', 'already.webp'] as $file) {
+    try {
+        $pixels = ImageInput::pixels($file);
+    } catch (SkippedInput $e) {
+        // $e->reason(): 'webp (already the target format)'
+        // $e->slug(): 'skipped_webp'
+        // $e->meta: size and container, read from the header
+        continue;
+    }
+
+    // Encode or enqueue $pixels here.
+}
+```
+
+`SkippedInput` extends `RuntimeException`. You can also check ahead of time
+with `ImageInput::isWebp($file)`.
+
+If you do want to re-encode a WebP, set `ImageInput::$skipWebp = false` or use
+`--reencode-webp` on the command line. You'll need GD to read the source.
+
+On the command line, a skip returns **exit code 4** and leaves the output
+alone. A queue can use that to tell a skipped file from a failed conversion.
 
 ## What it supports
 
-**Input formats:** PNG and JPEG files through the bundled readers, plus raw RGB
-(and an optional raw alpha plane) through the encoder itself, and WebP in —
-detected and skipped. See [Input formats](#input-formats) for exactly what the
-bundled readers cover.
+Transparency is kept by default, including palette PNGs and PNGs that mark
+a particular colour as transparent with `tRNS`. The bundled PNG reader keeps
+all eight bits of alpha. The alpha channel is then encoded losslessly in an
+`ALPH` chunk alongside the lossy colour data. Opaque images use the simpler
+`VP8 ` container.
 
-Palette PNGs are expanded to true colour before anything reads a pixel —
-libgd hands back palette *indices* from `imagecolorat()`, so an indexed PNG
-used to be coded as whatever colours those small integers happened to name.
+Use `--alpha=flatten` to drop transparency, or `--alpha=fail` if you'd rather
+send transparent images through another tool.
 
-**Transparency:** a source with a usable alpha channel gets the extended
-container — `VP8X` + `ALPH` + `VP8 ` — with the alpha plane coded losslessly
-and byte-exactly. Fully opaque images keep the simple `VP8 ` container.
-`--alpha=flatten` restores the old "drop it" behaviour, `--alpha=fail` refuses
-the image so a caller can route it somewhere else.
+ICC colour profiles from PNG `iCCP` and JPEG `APP2` chunks are copied into
+the WebP. `--no-icc` leaves the profile out; `--icc=FILE` supplies your own.
 
-Both the indexed-PNG case and a `tRNS` chunk on a truecolour PNG are handled;
-libgd ignores the latter, which used to make those images come out opaque.
-
-**Colour profiles:** PNG `iCCP` and JPEG `APP2` profiles are read and written
-out as an `ICCP` chunk, so a tagged source stays tagged. `--no-icc` drops the
-profile, `--icc=FILE` replaces it.
-
-EXIF is not carried over, and orientation tags are not applied: pixels are
-coded exactly as the decoder hands them over, which is what GD- and
-Imagick-based pipelines do too.
+EXIF metadata isn't copied, and orientation tags aren't applied. If a photo
+needs rotating, do that before you pass it to picowebp.
 
 ## Sizes
 
@@ -332,58 +366,51 @@ megapixels before you start.
 to end in one process, and checks that its bytes match the single-shot encoder
 on every run.
 
-Whichever path you take: everything here belongs in a queue, never inline in a
-page request.
-
-If a page request ever waits on this, you have done it wrong. Tick it from a
-background queue.
+Run either encoding path from a background queue so page requests remain
+responsive.
 
 ## Limitations
 
-Four things worth knowing before this goes in front of a real media library.
-Everything below is measured, not estimated; the numbers come from this machine
-(PHP 8.4, macOS), q80, shipped defaults.
+These are the limits most likely to matter when processing a media library.
+The timings below were measured on macOS with PHP 8.4, quality 80 and the
+default settings.
 
-**1. A 12 MP photo is a queue job measured in minutes, and it is not a shared
-hosting job at all.** Encode-only, shipped defaults: 377 s at 84 MB peak for
-one 12 MP frame, plus up to 18 s to read the JPEG (1.5 s if GD does the read).
-Split into two-second ticks that is ~190 ticks and ~10 minutes of wall clock,
-which a queue handles fine and a CloudLinux CPU meter will notice if the ticks
-run back to back. Below 2 MP the arithmetic is much friendlier — 25 s for a
-0.96 MP image, 37 s for a 1.64 MP one — but a
-1,000-image library still lands in the **7–22 CPU-hour** range depending on how
-big the pictures are. Cap by megapixels, spread the ticks, and never start one
-in a page request.
+**Large images take time.** A 12 MP frame takes 377 s to encode and peaks at
+84 MB, plus up to 18 s to read the JPEG (1.5 s with GD). Split into two-second
+ticks, that's ~190 ticks and ~10 minutes of wall clock. Running those
+ticks back to back can still use up a shared host's CPU allowance.
 
-**2. Progressive JPEG needs GD.** The bundled reader is baseline-sequential
-only, and adding progressive is the single biggest piece of work left in the
-codec: about 500 lines for DC/AC first and refinement scans, and a coefficient
-buffer that has to hold the whole frame (36 MB packed at 12 MP, 363 MB if kept
-as PHP arrays) before the inverse transform can run once at the end. It is
-affordable in CPU — the Huffman layer is only 13% of decode time, so the added
-scans cost roughly +17–27% — but it is expensive in memory and in the number of
-ways it can be subtly wrong. On a 128 MB host, adding that buffer to a peak
-that is already 84 MB at 12 MP is the difference between working and not
-working, so a progressive decoder in pure PHP would realistically ship with a
-megapixel cap attached. Where GD exists, it already handles those files.
+Smaller images are easier to manage: 25 s for a 0.96 MP image and 37 s for a
+1.64 MP one. Even so, a 1,000-image library adds up to **7–22 CPU-hours** of work,
+depending on image size. Set a megapixel limit, leave time between queue ticks,
+and keep the work out of page requests.
 
-**3. Flat graphics are libwebp's home turf.** On logos, app-UI captures and
-flat artwork libwebp wins by up to 21% on bytes, and that is where the
-transform-based approach is structurally weakest. If a conversion comes out
-larger than the file it replaces, the honest answer is not to convert it —
-which is what a keep-if-smaller rule is for in a WordPress pipeline.
+**Progressive JPEG needs GD.** The bundled reader only handles baseline JPEG.
+Adding progressive support would mean about 500 lines for DC/AC first and
+refinement scans, plus a buffer for the whole frame: 36 MB packed at 12 MP,
+or 363 MB as PHP arrays. The inverse transform has to wait until all the
+scans are read.
 
-**4. PSNR is not the same as quality.** picowebp is 0.05–0.25 dB below libwebp
+The extra CPU cost is estimated at +17–27%; Huffman decoding currently takes
+13% of decode time. Memory is the harder problem. On a 128 MB host, that
+buffer would sit on top of a peak already at 84 MB for a 12 MP image. A pure
+PHP implementation would need a megapixel cap. For now, GD handles these files.
+
+**Logos and screenshots can come out larger.** picowebp produces files up to
+21% larger than libwebp on the flat artwork and app screenshots in these benchmarks.
+Check the output size before replacing an original. Sometimes keeping the
+original is the better choice.
+
+**PSNR only tells you part of the story.** picowebp is 0.05–0.25 dB below libwebp
 on the fixtures and 0.2–1.6 dB below on the real photographs, while producing
 fewer bytes on most of them. On images with transparency it is not even
 comparable: the RGB under a fully transparent pixel is arbitrary, so two
 encoders that look identical on screen can "differ" by 20 dB.
 
-What would move the needle most, in order: an integer or otherwise faster
-inverse DCT (52% of decode time, and it would help every JPEG), tuning the
-trellis pass before anyone enables it (it currently buys 14% fewer bytes for
-2.8 dB of PSNR on a real photograph, which is not a good trade), then
-progressive support.
+The most useful improvements would be a faster inverse DCT (52% of decode
+time), better trellis tuning, and progressive JPEG support. Trellis currently
+saves 14% on file size at a cost of 2.8 dB of PSNR on a real photograph, so it
+stays off by default.
 
 ## Tests
 
@@ -392,27 +419,27 @@ composer test
 # or: php tests/run.php
 ```
 
-The suite checks bitstream structure, the alpha and ICC containers, and — when
-`dwebp` is on `PATH` — decodes our own output back and measures PSNR against
-the source. It runs the bundled readers and the GD path both, and it checks the
-WebP-input skip from every side: the header parse for all three containers, the
-exception, the staging path, and the CLI's exit code and quiet output.
-It also runs the CLI against destinations that cannot be written — a missing
-directory, a directory, a `--dump-yuv` path that will not open — and insists
-each one exits nonzero rather than reporting a save that never happened.
+The tests check the WebP bitstream, transparency, colour profiles, image
+readers, resumable encoding and CLI behaviour. If `dwebp` is on `PATH`, they
+also decode the output with libwebp and compare it with the source.
 
-The research tree this package grew out of has the heavier checks:
-`check-png-reader.php` proves the PNG reader against independently generated
-ground truth (and against libgd where libgd is exact), and
-`check-jpeg-reader.php` proves the JPEG reader against libjpeg across
-subsampling, restart markers, optimised tables, greyscale and odd geometry.
+There are checks for things that tend to go wrong in a queue: files that are
+already WebP, malformed inputs, invalid options and output paths that can't
+be written. The tests also cover reader reuse and resuming an encode without
+changing the resulting bytes.
+
+The separate research tree this package came from has more reader checks.
+`check-png-reader.php` compares PNG decoding with generated fixtures and GD;
+`check-jpeg-reader.php` compares JPEG decoding with libjpeg across sampling
+factors, restart markers, optimised tables, greyscale and odd image sizes.
+Those scripts aren't included in this repository.
 
 ## Not included
 
-The `PicoWebP\Spike\Vp8lEncoder` class is an internal helper: it supplies the
-headerless lossless stream that `ALPH` chunks need. It is not a PNG
-replacement — as a general lossless encoder it emits 123–124% of the source
-PNG where libwebp lossless manages 68–76%.
+There's no general-purpose lossless WebP encoder here.
+`PicoWebP\Spike\Vp8lEncoder` is an internal helper for alpha channels. Used
+for a whole image, its output is 123–124% of the source PNG size, where
+libwebp lossless manages 68–76%.
 
 ## Changelog
 
